@@ -2,7 +2,11 @@ import pandas as pd
 import pytest
 
 from nba_analytics.data.bbref import parse_table
-from nba_analytics.players.usage_efficiency import build_usage_ts, season_rows
+from nba_analytics.players.usage_efficiency import (
+    build_usage_ts,
+    plot_usage_ts_interactive,
+    season_rows,
+)
 
 
 def _adv(rows):
@@ -65,3 +69,11 @@ def test_parse_table_reads_data_stat_and_commented_tables():
     </tbody></table> --></body></html>"""
     df = parse_table(html, "t")
     assert df.to_dict("records") == [{"name_display": "X", "player_id": "x01", "games": 5}]
+
+
+def test_interactive_plot_has_one_trace_per_team_with_player_hover():
+    fig = plot_usage_ts_interactive(build_usage_ts(ADV, PG), "G", relative=True, n_labels=1)
+    assert sorted(t.name for t in fig.data) == ["BOS", "CLE"]
+    players = {row[0] for t in fig.data for row in t.customdata}
+    assert players == {"Traded Guard", "Starter Guard"}
+    assert len(fig.layout.annotations) == 1
