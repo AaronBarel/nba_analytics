@@ -1,0 +1,23 @@
+# Private — never commit
+CLAUDE.md
+.claude/
+private/
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Data / caches
+data/raw/
+data/cache/
+*.parquet
+*.sqlite
+
+# Notebooks
+.ipynb_checkpoints/
