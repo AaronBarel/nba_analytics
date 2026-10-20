@@ -10,6 +10,7 @@ FIGURES_DIR = ROOT / "reports" / "figures"
 
 POSITIONS = ["PG", "SG", "SF", "PF", "C"]
 POSITION_GROUPS = {"G": ["PG", "SG"], "F": ["SF", "PF"], "C": ["C"]}
+POS_TO_GROUP = {pos: group for group, members in POSITION_GROUPS.items() for pos in members}
 
 
 def season_label(end_year: int) -> str:
