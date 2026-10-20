@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT / "data"
 CACHE_DIR = DATA_DIR / "cache"
+PROCESSED_DIR = DATA_DIR / "processed"
 FIGURES_DIR = ROOT / "reports" / "figures"
 
 POSITIONS = ["PG", "SG", "SF", "PF", "C"]

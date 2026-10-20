@@ -176,7 +176,7 @@ def plot_usage_ts_interactive(df: pd.DataFrame, position: str, relative: bool = 
     fig.add_vline(x=sub["usg_pct"].mean(), line={"color": "#9a9a9a", "width": 1, "dash": "dash"})
     fig.update_layout(
         title={"text": title, "x": 0.01}, xaxis_title="Usage %", yaxis_title=ylabel,
-        template="plotly_white", width=1000, height=760, legend_title_text="Team",
+        template="plotly_white", width=1000, height=860, legend_title_text="Team",
         legend={"font": {"size": 10}, "tracegroupgap": 0}, margin={"t": 60},
         hoverlabel={"bgcolor": "white"},
     )
