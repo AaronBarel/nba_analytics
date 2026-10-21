@@ -32,12 +32,18 @@ PLAYER_TABLES = {
 }
 
 TEAM_HREF = re.compile(r"/teams/([A-Z]{3})/")
+PLAYER_HREF = re.compile(r"/players/[a-z]/([a-z0-9]+)\.html")
 
 _last_request = 0.0
 
 
-def fetch(path: str, cache_dir: Path = CACHE_DIR / "bbref", refresh: bool = False) -> str:
-    """Return the HTML for ``path`` (e.g. '/leagues/NBA_2026_advanced.html')."""
+def fetch(path: str, cache_dir: Path = CACHE_DIR / "bbref", refresh: bool = False,
+          base_url: str = BASE_URL) -> str:
+    """Return the HTML for ``path`` (e.g. '/leagues/NBA_2026_advanced.html').
+
+    ``base_url`` lets other Sports-Reference sites share the cache logic and the
+    request spacing, which is enforced across all of them.
+    """
     global _last_request
     cache_file = cache_dir / path.strip("/").replace("/", "__")
     if cache_file.exists() and not refresh:
@@ -48,7 +54,7 @@ def fetch(path: str, cache_dir: Path = CACHE_DIR / "bbref", refresh: bool = Fals
         if wait > 0:
             time.sleep(wait)
         try:
-            resp = requests.get(BASE_URL + path, headers={"User-Agent": USER_AGENT}, timeout=30)
+            resp = requests.get(base_url + path, headers={"User-Agent": USER_AGENT}, timeout=30)
         except (requests.ConnectionError, requests.Timeout):
             resp = None
         _last_request = time.monotonic()
@@ -59,7 +65,7 @@ def fetch(path: str, cache_dir: Path = CACHE_DIR / "bbref", refresh: bool = Fals
         if attempt < len(RETRY_BACKOFF) - 1:
             time.sleep(backoff)
     if resp is None:
-        raise ConnectionError(f"could not reach {BASE_URL + path}")
+        raise ConnectionError(f"could not reach {base_url + path}")
     resp.raise_for_status()
     resp.encoding = "utf-8"  # no charset in the headers; requests would guess Latin-1
 
@@ -73,7 +79,8 @@ def parse_table(html: str, table_id: str) -> pd.DataFrame:
 
     Some tables are shipped inside HTML comments and only rendered by
     JavaScript, so comments are searched when the table isn't found directly.
-    The player id (e.g. 'jamesle01') is added as ``player_id`` and the first
+    The player id (e.g. 'jamesle01', from ``data-append-csv`` or the player
+    link) is added as ``player_id`` and the first
     linked team (e.g. 'BOS') as ``team_id`` when present.
     """
     soup = BeautifulSoup(html, "lxml")
@@ -98,6 +105,8 @@ def parse_table(html: str, table_id: str) -> pd.DataFrame:
             record[stat] = cell.get_text(strip=True)
             if cell.get("data-append-csv"):
                 record["player_id"] = cell["data-append-csv"]
+            elif stat == "player" and (plink := cell.find("a", href=PLAYER_HREF)):
+                record["player_id"] = PLAYER_HREF.search(plink["href"]).group(1)
             link = cell.find("a", href=TEAM_HREF)
             if link is not None and "team_id" not in record:
                 record["team_id"] = TEAM_HREF.search(link["href"]).group(1)
@@ -163,3 +172,47 @@ def team_on_off(team_id: str, season: int, refresh: bool = False) -> pd.DataFram
     df.insert(0, "season", season)
     df.insert(1, "team_id", team_id)
     return df
+
+
+CBB_HREF = re.compile(r"https?://www\.sports-reference\.com(/cbb/players/[a-z0-9-]+\.html)")
+_ORD = r"(\d+)(?:st|nd|rd|th)"
+DRAFT = re.compile(rf"{_ORD} round \({_ORD} pick, {_ORD} overall\), (\d{{4}}) NBA Draft")
+
+
+def player_page(player_id: str, refresh: bool = False) -> str:
+    return fetch(f"/players/{player_id[0]}/{player_id}.html", refresh=refresh)
+
+
+def player_bio(html: str) -> dict:
+    """Height, weight, birth date, draft slot, recruiting rank and college page path.
+
+    Missing fields are None: undrafted players have no draft slot, players who
+    skipped college have no college path, and older players have no RSCI rank.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    meta = soup.find(id="meta")
+    text = " ".join(meta.get_text(" ").split()) if meta else ""
+    birth = soup.find(attrs={"data-birth": True})
+    cbb = CBB_HREF.search(html)
+    draft = DRAFT.search(text)
+    height = re.search(r"\((\d+)\s*cm", text)
+    weight = re.search(r"(\d+)\s*kg\)", text)
+    rsci = re.search(r"Recruiting Rank: (\d{4}) \((\d+)\)", text)
+    return {
+        "height_cm": int(height.group(1)) if height else None,
+        "weight_kg": int(weight.group(1)) if weight else None,
+        "birth_date": birth["data-birth"] if birth else None,
+        "draft_year": int(draft.group(4)) if draft else None,
+        "draft_round": int(draft.group(1)) if draft else None,
+        "draft_pick": int(draft.group(3)) if draft else None,
+        "rsci_rank": int(rsci.group(2)) if rsci else None,
+        "cbb_path": cbb.group(1) if cbb else None,
+    }
+
+
+def draft_class(year: int, refresh: bool = False) -> pd.DataFrame:
+    """Every pick in an NBA draft, with ``player_id`` and the drafting team."""
+    df = parse_table(fetch(f"/draft/NBA_{year}.html", refresh=refresh), "stats")
+    df = df[df["pick_overall"].notna()].copy()
+    df.insert(0, "draft_year", year)
+    return df.reset_index(drop=True)

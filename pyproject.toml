@@ -19,6 +19,7 @@ dependencies = [
     "plotly>=7.1.0",
     "pyarrow>=26.0.0",
     "requests>=2.34.2",
+    "scikit-learn>=1.9.1",
 ]
 
 [build-system]
