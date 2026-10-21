@@ -214,11 +214,13 @@ def last_season(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def features(frame: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
+def features(frame: pd.DataFrame, base: pd.DataFrame, extra: list[str] = ()) -> pd.DataFrame:
+    """Model inputs; ``extra`` names additional ``frame`` columns (e.g. G League stats)."""
     lagged = [f"{c}_{k}" for c in LAG_STATS for k in LAGS]
-    extra = ["age", "career_season", "usg_change", "mpg_change",
-             *[f"{c}_3yr" for c in ["all_star", "all_nba", "all_def", "mvp_votes"]]]
-    return pd.concat([frame[lagged + extra], base.add_prefix("marcel_")], axis=1)
+    context = ["age", "career_season", "usg_change", "mpg_change",
+               *[f"{c}_3yr" for c in ["all_star", "all_nba", "all_def", "mvp_votes"]]]
+    return pd.concat([frame[lagged + context + list(extra)], base.add_prefix("marcel_")],
+                     axis=1)
 
 
 def model() -> HistGradientBoostingRegressor:
@@ -241,7 +243,7 @@ def _weights(frame: pd.DataFrame, target: str) -> pd.Series:
 
 
 def fit_predict(frame: pd.DataFrame, seasons: pd.DataFrame, train_seasons: pd.Series,
-                predict_rows: pd.Series) -> pd.DataFrame:
+                predict_rows: pd.Series, extra: list[str] = ()) -> pd.DataFrame:
     """Fit baselines and residual models on ``train_seasons`` rows; predict ``predict_rows``.
 
     Returns last-season, Marcel and model projections for every target.
@@ -249,7 +251,7 @@ def fit_predict(frame: pd.DataFrame, seasons: pd.DataFrame, train_seasons: pd.Se
     first_predicted = int(frame.loc[predict_rows, "season"].min())
     curves = age_curves(seasons, before=first_predicted)
     base = marcel(frame, seasons, curves)
-    X = features(frame, base)
+    X = features(frame, base, extra)
     out = {"last": last_season(frame.loc[predict_rows]), "marcel": base.loc[predict_rows]}
     model_preds = {}
     for t in TARGETS:
@@ -264,11 +266,12 @@ def fit_predict(frame: pd.DataFrame, seasons: pd.DataFrame, train_seasons: pd.Se
 
 
 def walk_forward(frame: pd.DataFrame, seasons: pd.DataFrame, first_test: int,
-                 last_test: int) -> pd.DataFrame:
+                 last_test: int, extra: list[str] = ()) -> pd.DataFrame:
     """Project each test season from models fit on all earlier seasons."""
     parts = []
     for s in range(first_test, last_test + 1):
-        parts.append(fit_predict(frame, seasons, frame["season"] < s, frame["season"] == s))
+        parts.append(fit_predict(frame, seasons, frame["season"] < s, frame["season"] == s,
+                                 extra))
     return pd.concat(parts)
 
 
