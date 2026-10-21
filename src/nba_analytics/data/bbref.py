@@ -28,6 +28,7 @@ PLAYER_TABLES = {
     "totals": "totals_stats",
     "per_poss": "per_poss",
     "advanced": "advanced",
+    "play-by-play": "pbp_stats",
 }
 
 TEAM_HREF = re.compile(r"/teams/([A-Z]{3})/")
@@ -141,6 +142,24 @@ def team_game_log(team_id: str, season: int, refresh: bool = False) -> pd.DataFr
     df = parse_table(html, "team_game_log_reg")
     df = df[df["team_game_num_season"].notna()].reset_index(drop=True)
     df = df.drop(columns="team_id")  # the only linked team here is the opponent
+    df.insert(0, "season", season)
+    df.insert(1, "team_id", team_id)
+    return df
+
+
+def team_on_off(team_id: str, season: int, refresh: bool = False) -> pd.DataFrame:
+    """Team stats with each player on and off the court (2000-01 onward).
+
+    Three rows per player: 'On Court', 'Off Court' and 'On − Off'. Columns
+    prefixed ``opp_`` are the opponent's numbers, so ``opp_off_rtg`` is the
+    team's defensive rating for that split.
+    """
+    html = fetch(f"/teams/{team_id}/{season}/on-off/", refresh=refresh)
+    df = parse_table(html, "on_off")
+    df["player_id"] = df["player_id"].ffill()  # the On − Off row has no player link
+    df["split_id"] = df["split_id"].str.replace("\u2212", "-")
+    df["mp"] = pd.to_numeric(df["mp"], errors="coerce")  # On − Off row holds a share, e.g. 66%
+    df = df.drop(columns=["player", "team_id"], errors="ignore")
     df.insert(0, "season", season)
     df.insert(1, "team_id", team_id)
     return df

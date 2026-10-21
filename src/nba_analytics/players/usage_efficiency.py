@@ -15,14 +15,12 @@ import plotly.graph_objects as go
 from adjustText import adjust_text
 from matplotlib.lines import Line2D
 
-from nba_analytics.config import POSITION_GROUPS, season_label
+from nba_analytics.config import POS_TO_GROUP, POSITION_GROUPS, season_label
 from nba_analytics.data.bbref import player_season_table
 from nba_analytics.viz.teams import TEAM_COLORS
 
 MIN_GAMES = 20
 MIN_MPG = 6.0
-
-_POS_TO_GROUP = {pos: group for group, members in POSITION_GROUPS.items() for pos in members}
 
 
 def _is_combined(team: pd.Series) -> pd.Series:
@@ -53,9 +51,9 @@ def build_usage_ts(advanced: pd.DataFrame, per_game: pd.DataFrame,
     pg = season_rows(per_game)[["player_id", "mp_per_g"]]
     df = adv.merge(pg, on="player_id", how="left")
     df = df[(df["games"] >= min_games) & (df["mp_per_g"] >= min_mpg)].copy()
-    df = df[df["pos"].isin(_POS_TO_GROUP)]
+    df = df[df["pos"].isin(POS_TO_GROUP)]
 
-    df["pos_group"] = df["pos"].map(_POS_TO_GROUP)
+    df["pos_group"] = df["pos"].map(POS_TO_GROUP)
     df["ts_pct"] = df["ts_pct"] * 100  # fraction -> percent, to match usg_pct
     df["ts_diff_pos"] = df["ts_pct"] - df.groupby("pos")["ts_pct"].transform("mean")
     df["ts_diff_group"] = df["ts_pct"] - df.groupby("pos_group")["ts_pct"].transform("mean")
