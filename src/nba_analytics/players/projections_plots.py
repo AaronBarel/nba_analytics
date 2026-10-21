@@ -58,6 +58,7 @@ def plot_mae_by_season(by_season: pd.DataFrame, target: str) -> go.Figure:
         ))
     fig.update_layout(
         title={"text": f"{label}: walk-forward MAE by season", "x": 0.01},
+        xaxis={"type": "category"},  # '2011-12' would otherwise parse as a date
         yaxis_title="MAE", template="plotly_white", width=1000, height=440,
         hoverlabel={"bgcolor": "white"}, hovermode="x unified",
         legend={"orientation": "h", "y": -0.18, "x": 0},
