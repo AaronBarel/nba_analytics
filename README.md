@@ -17,6 +17,7 @@ The team notebooks need a one-time backfill of team game logs (~45 minutes):
 ```bash
 uv run python scripts/backfill_team_data.py 2001 2026
 uv run python scripts/backfill_player_data.py 2023 2026   # ~10 minutes, for notebook 05
+uv run python scripts/backfill_player_data.py 2005 2026 --season-tables  # ~3 minutes, notebook 07
 uv run python scripts/backfill_college_data.py 2010 2026  # ~3 hours, for notebook 06
 ```
 
@@ -45,9 +46,10 @@ tests/
 | [04_early_season_predictiveness](notebooks/04_early_season_predictiveness.ipynb) | R² of first-N-games record and net rating vs. the rest of the season |
 | [05_defensive_value](notebooks/05_defensive_value.ipynb) | Defensive index (box score, advanced, on/off) and hidden-defender screen, 2022-23 to 2025-26 |
 | [06_rookie_projections](notebooks/06_rookie_projections.ipynb) | College stats → NBA rookie and first-four-season minutes and BPM; 2026 draft class projections |
+| [07_season_projections](notebooks/07_season_projections.ipynb) | Next-season games, minutes, per-100 stats, TS%, usage and BPM: Marcel baseline vs. residual model, walk-forward 2013-14 to 2025-26; aging curves; 2026-27 projections |
 
 ## Roadmap
 
-- Players: season projection model, per-game stat projections
+- Players: per-game stat projections
 - Rookies: G League exploration
 - Teams: game outcome model, draft-incentive factor under the 2027 lottery rules
