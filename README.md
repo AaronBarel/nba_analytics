@@ -20,6 +20,7 @@ uv run python scripts/backfill_player_data.py 2023 2026   # ~10 minutes, for not
 uv run python scripts/backfill_player_data.py 2005 2026 --season-tables  # ~3 minutes, notebook 07
 uv run python scripts/backfill_college_data.py 2010 2026  # ~3 hours, for notebook 06
 uv run python scripts/backfill_gleague_data.py 2008 2026  # ~3 minutes, for notebook 08
+uv run python scripts/backfill_player_gamelogs.py 2014 2026  # ~7 hours, for notebook 09
 ```
 
 Charts are interactive (hover for details) in JupyterLab or VS Code. GitHub shows static images.
@@ -49,8 +50,10 @@ tests/
 | [06_rookie_projections](notebooks/06_rookie_projections.ipynb) | College stats → NBA rookie and first-four-season minutes and BPM; 2026 draft class projections |
 | [07_season_projections](notebooks/07_season_projections.ipynb) | Next-season games, minutes, per-100 stats, TS%, usage and BPM: Marcel baseline vs. residual model, walk-forward 2013-14 to 2025-26; aging curves; 2026-27 projections |
 | [08_gleague_exploration](notebooks/08_gleague_exploration.ipynb) | G League → NBA linking, the G League pathway, how each stat translates to the next NBA season, and whether G League stats improve the projection models |
+| [09_game_outcomes](notebooks/09_game_outcomes.ipynb) | Home win probability and margin from Elo, team ratings, schedule and travel, roster talent, availability and turnover; walk-forward 2015-16 to 2025-26 |
 
 ## Roadmap
 
 - Players: per-game stat projections
-- Teams: game outcome model, draft-incentive factor under the 2027 lottery rules
+- Teams: draft-incentive factor under the 2027 lottery rules
+- Live predictions for upcoming games from the official injury report
