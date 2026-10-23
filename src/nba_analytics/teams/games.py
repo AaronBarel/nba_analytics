@@ -70,6 +70,7 @@ def elo(games: pd.DataFrame, k: float = 20.0, home_adv: float = 100.0,
 
     Between seasons each rating keeps ``carryover`` of its distance from the
     mean. Returns ``elo_home``, ``elo_away`` and ``elo_prob`` (home win).
+    Scheduled games (no margin yet) get a prediction but move no ratings.
     """
     rating: dict[str, float] = {}
     first_season = games["season"].min()
@@ -86,6 +87,8 @@ def elo(games: pd.DataFrame, k: float = 20.0, home_adv: float = 100.0,
         diff = rh - ra + (0 if neutral else home_adv)
         prob = 1 / (1 + 10 ** (-diff / 400))
         out[i] = rh, ra, prob
+        if np.isnan(margin):
+            continue
         win_diff = diff if margin > 0 else -diff  # rating edge of the winner
         mult = (abs(margin) + 3) ** 0.8 / (7.5 + 0.006 * win_diff)
         shift = k * mult * ((margin > 0) - prob)
@@ -142,13 +145,16 @@ def blended_counts(logs: pd.DataFrame, counts: list[str]) -> pd.DataFrame:
     Season-to-date per-game counts are averaged with ``PRIOR_GAMES`` games at
     last season's per-game counts (regressed toward the league), so early
     games lean on last season and later games on this one. A franchise's first
-    season uses the league average as its prior. Rows follow ``logs`` sorted by
+    season uses the league average as its prior. Scheduled games (no result
+    yet) are kept but count for nothing. Rows follow ``logs`` sorted by
     season, team and date, with those keys and ``games_played`` included.
     """
     df = logs.sort_values(["season", "team_id", "date"]).reset_index(drop=True)
-    g = df.groupby(["season", "team_id"])
-    cum = g[counts].cumsum() - df[counts]  # before this game
-    n = g.cumcount()
+    keys = [df["season"], df["team_id"]]
+    played = df["pts"].notna()
+    filled = df[counts].fillna(0)
+    cum = filled.groupby(keys).cumsum() - filled  # before this game
+    n = played.groupby(keys).cumsum() - played
 
     league = df.groupby("season")[counts].mean()
     prior = df.groupby(["season", "franchise"])[counts].mean().reset_index()
@@ -176,8 +182,11 @@ def strength_features(logs: pd.DataFrame) -> pd.DataFrame:
     blended = blended_counts(logs, COUNTS)
     out = _rates(blended[COUNTS])
     df = logs.sort_values(["season", "team_id", "date"]).reset_index(drop=True)
-    roll = df.groupby(["season", "team_id"])[["pts", "opp_pts", "poss"]].transform(
-        lambda s: s.shift(1).rolling(FORM_GAMES, min_periods=1).sum())
+    keys = [df["season"], df["team_id"]]
+    played = df[df["pts"].notna()]
+    through = played.groupby(["season", "team_id"])[["pts", "opp_pts", "poss"]].transform(
+        lambda s: s.rolling(FORM_GAMES, min_periods=1).sum()).reindex(df.index)
+    roll = through.groupby(keys).shift(1).groupby(keys).ffill()  # before this game
     form = 100 * (roll["pts"] - roll["opp_pts"]) / roll["poss"]
     out["form_net_rtg"] = form.fillna(out["net_rtg"])
     out["games_played"] = blended["games_played"]
@@ -223,20 +232,30 @@ def game_dataset(first: int, last: int, refresh: bool = False) -> pd.DataFrame:
     cache = PROCESSED_DIR / f"games_{first}_{last}.parquet"
     if cache.exists() and not refresh:
         return pd.read_parquet(cache)
-    logs = game_logs(range(2001, last + 1))
+    games = game_rows(game_logs(range(2001, last + 1)), roster.gamelogs(first, last),
+                      roster.player_values(first, last), first)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    games.to_parquet(cache)
+    return games
+
+
+def game_rows(logs: pd.DataFrame, gl: pd.DataFrame, values: pd.DataFrame, first: int
+              ) -> pd.DataFrame:
+    """Games from season ``first`` on with every feature.
+
+    ``logs`` are team game logs (from earlier seasons too, to warm up Elo and
+    team rates), ``gl`` player game rows and ``values`` pre-season player
+    values for the seasons in ``gl``. Scheduled games may be included.
+    """
     games = game_features(logs, ELO_PARAMS)
     games = games[games["season"] >= first].reset_index(drop=True)
-
-    gl = roster.gamelogs(first, last)
-    per_team = roster.team_talent(gl, roster.player_values(first, last)).merge(
+    per_team = roster.team_talent(gl, values).merge(
         roster.returning_minutes(gl, first), on=["season", "team_id", "date"], how="left")
     for side in ["home", "away"]:
         part = per_team.rename(columns={"team_id": side, **{c: f"{side}_{c}" for c in ROSTER}})
         games = games.merge(part, on=["season", "date", side], how="left")
     for c in ["talent", "talent_missing", "returning_share"]:
         games[f"diff_{c}"] = games[f"home_{c}"] - games[f"away_{c}"]
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    games.to_parquet(cache)
     return games
 
 
@@ -286,30 +305,43 @@ MODELS = {"Logistic regression": ("win", _logistic),
           "Boosted trees (margin)": ("margin", _boosted_regressor)}
 
 
-def walk_forward(df: pd.DataFrame, features: list[str], first_test: int, last_test: int,
-                 first_train: int | None = None, models: dict = MODELS) -> pd.DataFrame:
-    """Out-of-sample home win probability (and margin) for each test season.
+def fit(train: pd.DataFrame, features: list[str], models: dict = MODELS) -> dict:
+    """Fit each model; margin models also keep their training residual SD."""
+    fitted = {}
+    for name, (kind, make) in models.items():
+        if kind == "win":
+            fitted[name] = (kind, make().fit(train[features], train["home_win"]), None)
+        else:
+            m = make().fit(train[features], train["margin"])
+            fitted[name] = (kind, m, np.std(train["margin"] - m.predict(train[features])))
+    return fitted
+
+
+def predict(fitted: dict, test: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+    """Home win probability from each model, plus ``<name> pred`` margins.
 
     Margin models turn the predicted margin into a win probability with a
     normal distribution whose spread is the training residual SD.
     """
+    out = test[["game_id", "season", "home_win", "margin"]].copy()
+    for name, (kind, m, sd) in fitted.items():
+        if kind == "win":
+            out[name] = m.predict_proba(test[features])[:, 1]
+        else:
+            pred = m.predict(test[features])
+            out[f"{name} pred"] = pred
+            out[name] = norm.cdf(pred / sd)
+    return out
+
+
+def walk_forward(df: pd.DataFrame, features: list[str], first_test: int, last_test: int,
+                 first_train: int | None = None, models: dict = MODELS) -> pd.DataFrame:
+    """Out-of-sample home win probability (and margin) for each test season."""
     first_train = first_train or int(df["season"].min())
     parts = []
     for s in range(first_test, last_test + 1):
         train = df[(df["season"] >= first_train) & (df["season"] < s)]
-        test = df[df["season"] == s]
-        out = test[["game_id", "season", "home_win", "margin"]].copy()
-        for name, (kind, make) in models.items():
-            if kind == "win":
-                fit = make().fit(train[features], train["home_win"])
-                out[name] = fit.predict_proba(test[features])[:, 1]
-            else:
-                fit = make().fit(train[features], train["margin"])
-                sd = np.std(train["margin"] - fit.predict(train[features]))
-                pred = fit.predict(test[features])
-                out[f"{name} pred"] = pred
-                out[name] = norm.cdf(pred / sd)
-        parts.append(out)
+        parts.append(predict(fit(train, features, models), df[df["season"] == s], features))
     return pd.concat(parts, ignore_index=True)
 
 

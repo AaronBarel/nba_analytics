@@ -114,19 +114,21 @@ def player_seasons(first: int = HISTORY_START, last: int = 2026,
     return df
 
 
-def build_frame(seasons: pd.DataFrame, last: int) -> pd.DataFrame:
+def build_frame(seasons: pd.DataFrame, last: int, require_last: bool = True) -> pd.DataFrame:
     """One row per (player, target season) with lagged features and targets.
 
     Target seasons run from ``FIRST_TARGET`` to ``last + 1``. A player is
-    included if he played in any of the three prior seasons; for the
-    unplayed season ``last + 1`` he must have played in ``last``.
+    included if they played in any of the three prior seasons; for the
+    unplayed season ``last + 1`` they must have played in ``last`` unless
+    ``require_last`` is False (e.g. to cover players returning from a lost season).
     """
     keys = seasons[["player_id", "season"]]
     base = pd.concat([keys.assign(season=keys["season"] + k) for k in LAGS])
     base = base.drop_duplicates()
     base = base[(base["season"] >= FIRST_TARGET) & (base["season"] <= last + 1)]
-    active = set(seasons.loc[seasons["season"] == last, "player_id"])
-    base = base[(base["season"] <= last) | base["player_id"].isin(active)]
+    if require_last:
+        active = set(seasons.loc[seasons["season"] == last, "player_id"])
+        base = base[(base["season"] <= last) | base["player_id"].isin(active)]
 
     indexed = seasons.set_index(["player_id", "season"])
     frame = base.reset_index(drop=True)

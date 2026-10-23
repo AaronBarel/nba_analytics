@@ -62,14 +62,20 @@ CITIES = {
     "Paris": (48.839, 2.379, "Europe/Paris", 35),
     "Berlin": (52.508, 13.443, "Europe/Berlin", 35),
     "London": (51.503, 0.003, "Europe/London", 5),
+    "Manchester": (53.486, -2.200, "Europe/London", 40),
 }
 
 # Neutral-site regular-season games Basketball-Reference marks 'N', by date
 NEUTRAL_DATES = {
     "2024-11-02": "Mexico City", "2024-12-14": "Las Vegas", "2025-01-23": "Paris",
     "2025-01-25": "Paris", "2025-11-01": "Mexico City", "2025-12-13": "Las Vegas",
-    "2026-01-15": "Berlin", "2026-01-18": "London",
+    "2026-01-15": "Berlin", "2026-01-18": "London", "2026-11-07": "Mexico City",
+    "2027-01-14": "Paris", "2027-01-17": "Manchester",
 }
+# Arenas in schedules that mark a neutral-site game
+NEUTRAL_ARENAS = {"Arena CDMX": "Mexico City", "Mexico City Arena": "Mexico City",
+                  "Accor Arena": "Paris", "Co-op Live": "Manchester", "The O2 Arena": "London",
+                  "O2 Arena": "London", "Uber Arena": "Berlin", "T-Mobile Arena": "Las Vegas"}
 BUBBLE_START = "2020-07-30"  # 2019-20 restart, all games at Walt Disney World
 MAX_REST = 4  # rest days beyond this are treated the same
 EARTH_RADIUS_KM = 6371.0

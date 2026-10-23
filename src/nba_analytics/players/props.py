@@ -45,28 +45,35 @@ LINES = {"pts": [10, 15, 20, 25, 30], "trb": [4, 6, 8, 10, 12], "ast": [2, 4, 6,
 # --- Features ---------------------------------------------------------------
 
 def _player_history(df: pd.DataFrame) -> pd.DataFrame:
-    """Season-to-date and last-five-game minutes, starts and per-minute rates."""
+    """Season-to-date and last-five-game minutes, starts and per-minute rates.
+
+    Every row gets the values from games before it, including rows for games
+    the player missed or that haven't been played yet.
+    """
     df = df.sort_values(["season", "player_id", "date"]).reset_index(drop=True)
     played = df["mp"] > 0
     g = df.groupby(["season", "player_id"])
+    keys = [df["season"], df["player_id"]]
     out = pd.DataFrame(index=df.index)
     out["games_td"] = g["mp"].transform(lambda s: (s > 0).cumsum().shift(1, fill_value=0))
-    out["mp_td"] = g["mp"].cumsum() - df["mp"]
+    mp = df["mp"].fillna(0.0)
+    out["mp_td"] = mp.groupby(keys).cumsum() - mp
     out["mpg_td"] = out["mp_td"] / out["games_td"].replace(0, np.nan)
     out["start_share_td"] = (g["started"].cumsum() - df["started"]) / \
         out["games_td"].replace(0, np.nan)
 
-    # last five games played
+    # last five games played: totals through each played game, carried to later rows
     p = df[played]
     pg = p.groupby(["season", "player_id"])
-    roll = pg[["mp", "started", *STATS]].transform(
-        lambda s: s.shift(1).rolling(RECENT_GAMES, min_periods=1).sum())
-    n_recent = pg.cumcount().clip(upper=RECENT_GAMES).replace(0, np.nan)
-    recent = pd.DataFrame({"mpg_recent": roll["mp"] / n_recent,
-                           "start_share_recent": roll["started"] / n_recent}, index=p.index)
+    through = pg[["mp", "started", *STATS]].transform(
+        lambda s: s.rolling(RECENT_GAMES, min_periods=1).sum())
+    through["n"] = (pg.cumcount() + 1).clip(upper=RECENT_GAMES)
+    roll = through.reindex(df.index).groupby(keys).shift(1).groupby(keys).ffill()
+    n_recent = roll["n"]
+    out["mpg_recent"] = roll["mp"] / n_recent
+    out["start_share_recent"] = roll["started"] / n_recent
     for s in STATS:
-        recent[f"{s}_rate_recent"] = roll[s] / roll["mp"]
-    out = out.join(recent)  # empty on unplayed rows, which the models never use
+        out[f"{s}_rate_recent"] = roll[s] / roll["mp"]
     for s in STATS:
         out[f"{s}_td"] = g[s].transform(lambda x: x.fillna(0).cumsum()) - df[s].fillna(0)
         out[f"{s}_rate_td"] = out[f"{s}_td"] / out["mp_td"].replace(0, np.nan)
@@ -208,38 +215,51 @@ def prob_over(mu: np.ndarray, r: float | np.ndarray, line: float) -> np.ndarray:
     return stats.nbinom.sf(np.ceil(line) - 1, r, r / (r + mu))
 
 
-def fit_predict(df: pd.DataFrame, train: pd.Series, test: pd.Series) -> tuple[pd.DataFrame, dict]:
-    """Fit minutes, rate and dispersion on ``train`` played rows; predict ``test`` rows.
+def fit(train: pd.DataFrame) -> dict:
+    """Fit the minutes model, one rate model per stat, and negative binomial sizes.
 
-    Returns predictions (minutes, rate, mean and negative binomial size for
-    each stat, plus two baselines) and the fitted sizes, one per stat and
-    predicted-minutes bin: bench players' totals swing more with their minutes.
+    ``train`` holds played rows. Sizes are fit per stat and predicted-minutes
+    bin: bench players' totals swing more with their minutes.
     """
-    played = df["mp"] > 0
-    tr, te = df[train & played], df[test & played]
-    keys = ["player_id", "player", "season", "date", "team_id", "opp_id"]
-    out = te[[c for c in keys if c in te] + ["mp", *STATS, *CONTEXT]].copy()
-    minutes = _trees().fit(tr[MINUTES_FEATURES], tr["mp"])
-    out["mp_pred"] = minutes.predict(te[MINUTES_FEATURES]).clip(1, 48)
-    tr_mp = minutes.predict(tr[MINUTES_FEATURES]).clip(1, 48)
-    dispersion = {}
+    minutes = _trees().fit(train[MINUTES_FEATURES], train["mp"])
+    tr_mp = minutes.predict(train[MINUTES_FEATURES]).clip(1, 48)
+    models = {"minutes": minutes, "rates": {}, "sizes": {}}
     for s in STATS:
         f = rate_features(s)
-        rows = tr[s].notna()
-        rate = _trees("poisson").fit(tr.loc[rows, f], tr.loc[rows, s] / tr.loc[rows, "mp"],
-                                     sample_weight=tr.loc[rows, "mp"])
-        out[f"{s}_rate_pred"] = rate.predict(te[f])
+        rows = train[s].notna()
+        rate = _trees("poisson").fit(train.loc[rows, f], train.loc[rows, s] / train.loc[rows, "mp"],
+                                     sample_weight=train.loc[rows, "mp"])
+        mu_tr = tr_mp[rows.to_numpy()] * rate.predict(train.loc[rows, f])
+        bins_tr, y_tr = minute_bin(tr_mp[rows.to_numpy()]), train.loc[rows, s].to_numpy()
+        models["rates"][s] = rate
+        models["sizes"][s] = np.array([fit_dispersion(y_tr[bins_tr == b], mu_tr[bins_tr == b])
+                                       for b in range(len(MINUTE_BINS) - 1)])
+    return models
+
+
+def predict(models: dict, rows: pd.DataFrame) -> pd.DataFrame:
+    """Minutes, rate, mean and negative binomial size for each stat, plus two baselines."""
+    keys = ["player_id", "player", "season", "date", "team_id", "opp_id"]
+    out = rows[[c for c in keys if c in rows] + ["mp", *STATS, *CONTEXT]].copy()
+    out["mp_pred"] = models["minutes"].predict(rows[MINUTES_FEATURES]).clip(1, 48)
+    for s in STATS:
+        out[f"{s}_rate_pred"] = models["rates"][s].predict(rows[rate_features(s)])
         out[f"{s}_pred"] = out["mp_pred"] * out[f"{s}_rate_pred"]
-        out[f"{s}_baseline"] = te["expected_mp"] * te[f"{s}_rate_blend"]
-        out[f"{s}_avg"] = (te[f"{s}_td"] / te["games_td"].replace(0, np.nan)).fillna(
+        out[f"{s}_baseline"] = rows["expected_mp"] * rows[f"{s}_rate_blend"]
+        out[f"{s}_avg"] = (rows[f"{s}_td"] / rows["games_td"].replace(0, np.nan)).fillna(
             out[f"{s}_baseline"])
-        mu_tr = tr_mp[rows.to_numpy()] * rate.predict(tr.loc[rows, f])
-        bins_tr, y_tr = minute_bin(tr_mp[rows.to_numpy()]), tr.loc[rows, s].to_numpy()
-        sizes = np.array([fit_dispersion(y_tr[bins_tr == b], mu_tr[bins_tr == b])
-                          for b in range(len(MINUTE_BINS) - 1)])
-        dispersion[s] = sizes
-        out[f"{s}_size"] = sizes[minute_bin(out["mp_pred"].to_numpy())]
-    return out, dispersion
+        out[f"{s}_size"] = models["sizes"][s][minute_bin(out["mp_pred"].to_numpy())]
+    return out
+
+
+def fit_predict(df: pd.DataFrame, train: pd.Series, test: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """Fit on ``train`` played rows and predict ``test`` played rows.
+
+    Returns the predictions and the fitted sizes by stat.
+    """
+    played = df["mp"] > 0
+    models = fit(df[train & played])
+    return predict(models, df[test & played]), models["sizes"]
 
 
 def walk_forward(df: pd.DataFrame, first_test: int, last_test: int,

@@ -25,6 +25,18 @@ uv run python scripts/backfill_player_gamelogs.py 2014 2026  # ~7 hours, for not
 
 Charts are interactive (hover for details) in JupyterLab or VS Code. GitHub shows static images.
 
+### Predicting upcoming games
+
+```bash
+uv run python scripts/predict_games.py              # next date with unplayed games
+uv run python scripts/predict_games.py 2026-10-23   # a given date
+```
+
+This pulls the season's box scores, the playing teams' rosters and the NBA's latest official
+injury report, then prints home win probabilities, projected margins and player stat lines,
+saving them under `data/predictions/<date>/`. The models are the ones in notebooks 09 and 10,
+fit on every past season; players listed Out or Doubtful are treated as not playing.
+
 ## Layout
 
 ```
@@ -33,6 +45,7 @@ src/nba_analytics/
   players/    player-level analyses and models
   teams/      team-level analyses and models
   viz/        shared plotting helpers (team colors)
+  live.py     predictions for upcoming games
 notebooks/    reports and visualizations
 scripts/      data backfills
 tests/
@@ -56,4 +69,4 @@ tests/
 ## Roadmap
 
 - Teams: draft-incentive factor under the 2027 lottery rules
-- Live predictions for upcoming games from the official injury report
+- Season-to-date scoring of the live predictions

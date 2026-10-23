@@ -86,36 +86,76 @@ def player_values(first: int, last: int, refresh: bool = False) -> pd.DataFrame:
         return pd.read_parquet(cache)
     seasons = projections.player_seasons()
     frame = projections.build_frame(seasons, last=seasons["season"].max())
-    preds = projections.walk_forward(frame, seasons, first, last)
-    vets = frame.loc[preds.index, ["player_id", "season"]].assign(
-        bpm=preds[("model", "bpm")].to_numpy(), mpg=preds[("model", "mp_per_g")].to_numpy(),
-        **{c: preds[("model", c)].to_numpy() for c in PROJECTED_RATES},
-        source="Season projection")
+    vets = _veteran_values(frame, projections.walk_forward(frame, seasons, first, last))
 
     rk = rookies.rookie_dataset()
     debut = career_start(last)
     college = rk[~rk["draft_class"]].assign(season=lambda d: d["debut"])
-    college = _rookie_predictions(rk, college, rookies.FEATURE_SETS["All (adds draft slot, RSCI)"])
-
-    picks = pd.concat([draft_class(y)[["player_id", "pick_overall"]].assign(entry_year=y)
-                       for y in range(first - 6, last)], ignore_index=True)
-    picks = picks.dropna(subset=["player_id"]).drop_duplicates("player_id")
-    picks = picks[~picks["player_id"].isin(rk["player_id"])].assign(
-        log_pick=lambda d: np.log(d["pick_overall"]), drafted=1,
+    picks = _draft_picks(range(first - 6, last), rk).assign(
         season=lambda d: d["player_id"].map(debut))
+    out = _combine(vets, _rookie_values(rk, college, picks), first, last)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(cache)
+    return out
+
+
+def season_values(season: int, refresh: bool = False) -> pd.DataFrame:
+    """Pre-season values, as in ``player_values``, for a season not yet in the tables.
+
+    Veterans who played in any of the last three seasons get the season
+    projection fit on every earlier season (so players returning from a lost
+    season are covered); last summer's draft class gets the rookie models.
+    Cached to ``data/processed``.
+    """
+    cache = PROCESSED_DIR / f"season_values_{season}.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+    seasons = projections.player_seasons(last=season - 1)
+    frame = projections.build_frame(seasons, last=season - 1, require_last=False)
+    rows = frame["season"] == season
+    preds = projections.fit_predict(frame, seasons, frame["season"] < season, rows)
+    vets = _veteran_values(frame, preds)
+    rk = rookies.rookie_dataset(last=season - 1)
+    college = rk[rk["draft_class"]].assign(season=season)
+    picks = _draft_picks(range(season - 1, season), rk).assign(season=season)
+    out = _combine(vets, _rookie_values(rk, college, picks), season, season)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(cache)
+    return out
+
+
+def _veteran_values(frame: pd.DataFrame, preds: pd.DataFrame) -> pd.DataFrame:
+    return frame.loc[preds.index, ["player_id", "season"]].assign(
+        bpm=preds[("model", "bpm")].to_numpy(), mpg=preds[("model", "mp_per_g")].to_numpy(),
+        **{c: preds[("model", c)].to_numpy() for c in PROJECTED_RATES},
+        source="Season projection")
+
+
+def _draft_picks(years: range, rk: pd.DataFrame) -> pd.DataFrame:
+    """Drafted players with no college stats in ``rk`` (international, high school)."""
+    picks = pd.concat([draft_class(y)[["player_id", "pick_overall"]].assign(entry_year=y)
+                       for y in years], ignore_index=True)
+    picks = picks.dropna(subset=["player_id"]).drop_duplicates("player_id")
+    return picks[~picks["player_id"].isin(rk["player_id"])].assign(
+        log_pick=lambda d: np.log(d["pick_overall"]), drafted=1).reset_index(drop=True)
+
+
+def _rookie_values(rk: pd.DataFrame, college: pd.DataFrame, picks: pd.DataFrame
+                   ) -> pd.DataFrame:
+    college = _rookie_predictions(rk, college, rookies.FEATURE_SETS["All (adds draft slot, RSCI)"])
     picks = picks.dropna(subset=["season"]).reset_index(drop=True)
     drafted = _rookie_predictions(rk, picks, rookies.FEATURE_SETS["Draft slot"])
-
-    rook = pd.concat([college.assign(source="Rookie (college)"),
+    return pd.concat([college.assign(source="Rookie (college)"),
                       drafted.assign(source="Rookie (draft slot)")], ignore_index=True)
+
+
+def _combine(vets: pd.DataFrame, rook: pd.DataFrame, first: int, last: int) -> pd.DataFrame:
     rook = rook[rook["season"].between(first, last)]
     known = pd.MultiIndex.from_frame(vets[["player_id", "season"]])
     rook = rook[~pd.MultiIndex.from_frame(rook[["player_id", "season"]]).isin(known)]
     out = pd.concat([vets, rook], ignore_index=True)
     out["season"] = out["season"].astype(int)
     out["mpg"] = out["mpg"].clip(0, 40)
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(cache)
     return out
 
 
@@ -138,7 +178,8 @@ def expected_minutes(logs: pd.DataFrame, values: pd.DataFrame) -> pd.DataFrame:
 
     Expected minutes blend the projection with minutes played for the team in
     earlier games this season (``MINUTES_PRIOR_GAMES`` games of the projection),
-    so role changes show up as the season goes on.
+    so role changes show up as the season goes on. Rows for games not yet
+    played have ``mp`` missing and count for nothing.
     """
     cols = ["player_id", "season", "bpm", "mpg", *[c for c in PROJECTED_RATES if c in values]]
     df = logs.merge(values[cols], on=["player_id", "season"], how="left")
@@ -146,9 +187,11 @@ def expected_minutes(logs: pd.DataFrame, values: pd.DataFrame) -> pd.DataFrame:
     df["bpm"] = df["bpm"].fillna(REPLACEMENT_BPM)
     df["mpg"] = df["mpg"].fillna(REPLACEMENT_MPG)
     df = df.sort_values(["season", "player_id", "date"]).reset_index(drop=True)
-    g = df.groupby(["season", "player_id"])
-    mp_before = g["mp"].cumsum() - df["mp"]
-    games_before = g.cumcount()  # roster games, played or not
+    keys = [df["season"], df["player_id"]]
+    done = df["mp"].notna()
+    mp = df["mp"].fillna(0.0)
+    mp_before = mp.groupby(keys).cumsum() - mp
+    games_before = done.groupby(keys).cumsum() - done  # roster games, played or not
     df["expected_mp"] = ((MINUTES_PRIOR_GAMES * df["mpg"] + mp_before)
                          / (MINUTES_PRIOR_GAMES + games_before))
     return df
