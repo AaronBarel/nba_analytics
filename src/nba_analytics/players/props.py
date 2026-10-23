@@ -1,0 +1,303 @@
+"""Per-game player projections (P4): points, rebounds, assists, steals and blocks.
+
+A stat's expected value is expected minutes times an expected per-minute rate,
+each from its own boosted-tree model; a negative binomial around that mean
+gives the probability of any line. Everything is known before tip-off, and
+availability is taken as known (in live use, from the injury report), so the
+models are fit and scored on games the player played.
+
+Inputs per player and game:
+
+* Pre-season projections (P2): minutes per game, per-100 rates, usage.
+* Season to date and last five games: minutes, per-minute rates, starts.
+* Teammates: expected minutes and usage of absent teammates.
+* Opponent: what it allows per possession for each stat, relative to the
+  league, season to date blended with last season.
+* Game: expected pace, the team's Elo edge (blowout risk), home, rest.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from scipy import optimize, special, stats
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+from nba_analytics.config import PROCESSED_DIR
+from nba_analytics.players.projections import player_seasons
+from nba_analytics.teams import roster
+from nba_analytics.teams.games import ELO_PARAMS, blended_counts, game_features, team_games
+from nba_analytics.teams.net_rating import game_logs
+
+STATS = {"pts": "Points", "trb": "Rebounds", "ast": "Assists", "stl": "Steals",
+         "blk": "Blocks"}
+RECENT_GAMES = 5
+# Minutes of the pre-season rate blended into the season-to-date rate (the
+# season projection's regression minutes, which were tuned on 2009-2013)
+PRIOR_MINUTES = {"pts": 250, "trb": 100, "ast": 100, "stl": 500, "blk": 250}
+# Opponent counts that measure what a defense allows for each stat
+ALLOWED = {"pts": "opp_pts", "trb": "opp_trb", "ast": "opp_ast", "stl": "tov",
+           "blk": "opp_blk"}
+LINES = {"pts": [10, 15, 20, 25, 30], "trb": [4, 6, 8, 10, 12], "ast": [2, 4, 6, 8, 10],
+         "stl": [1, 2, 3], "blk": [1, 2, 3]}
+
+
+# --- Features ---------------------------------------------------------------
+
+def _player_history(df: pd.DataFrame) -> pd.DataFrame:
+    """Season-to-date and last-five-game minutes, starts and per-minute rates."""
+    df = df.sort_values(["season", "player_id", "date"]).reset_index(drop=True)
+    played = df["mp"] > 0
+    g = df.groupby(["season", "player_id"])
+    out = pd.DataFrame(index=df.index)
+    out["games_td"] = g["mp"].transform(lambda s: (s > 0).cumsum().shift(1, fill_value=0))
+    out["mp_td"] = g["mp"].cumsum() - df["mp"]
+    out["mpg_td"] = out["mp_td"] / out["games_td"].replace(0, np.nan)
+    out["start_share_td"] = (g["started"].cumsum() - df["started"]) / \
+        out["games_td"].replace(0, np.nan)
+
+    # last five games played
+    p = df[played]
+    pg = p.groupby(["season", "player_id"])
+    roll = pg[["mp", "started", *STATS]].transform(
+        lambda s: s.shift(1).rolling(RECENT_GAMES, min_periods=1).sum())
+    n_recent = pg.cumcount().clip(upper=RECENT_GAMES).replace(0, np.nan)
+    recent = pd.DataFrame({"mpg_recent": roll["mp"] / n_recent,
+                           "start_share_recent": roll["started"] / n_recent}, index=p.index)
+    for s in STATS:
+        recent[f"{s}_rate_recent"] = roll[s] / roll["mp"]
+    out = out.join(recent)  # empty on unplayed rows, which the models never use
+    for s in STATS:
+        out[f"{s}_td"] = g[s].transform(lambda x: x.fillna(0).cumsum()) - df[s].fillna(0)
+        out[f"{s}_rate_td"] = out[f"{s}_td"] / out["mp_td"].replace(0, np.nan)
+    return pd.concat([df, out], axis=1)
+
+
+def _teammates(df: pd.DataFrame) -> pd.DataFrame:
+    """Per team and game: expected minutes and usage-weighted minutes of absent players."""
+    absent = ~df["available"]
+    usg = df["usg_pct"].fillna(18.0)  # league-average usage for unprojected players
+    t = df.assign(missing_mp=df["expected_mp"].where(absent, 0.0),
+                  missing_usg_mp=(df["expected_mp"] * usg).where(absent, 0.0),
+                  avail_mp=df["expected_mp"].where(~absent, 0.0))
+    return (t.groupby(["season", "team_id", "date"], as_index=False)
+            [["missing_mp", "missing_usg_mp", "avail_mp"]].sum())
+
+
+def _opponent(team_logs: pd.DataFrame) -> pd.DataFrame:
+    """What each team allows per possession for each stat, relative to the league average."""
+    logs = team_logs.assign(opp_trb=team_logs["opp_orb"] + team_logs["opp_drb"])
+    counts = sorted(set(ALLOWED.values()) | {"poss"})
+    b = blended_counts(logs, counts)
+    per_poss = b[counts].div(b["poss"], axis=0)
+    league = per_poss.groupby(b["season"]).transform("mean")
+    out = b[["season", "team_id", "date"]].copy()
+    for s, c in ALLOWED.items():
+        out[f"opp_allows_{s}"] = per_poss[c] / league[c]
+    out["pace"] = b["poss"]
+    return out
+
+
+def player_game_rows(gl: pd.DataFrame, values: pd.DataFrame, team_logs: pd.DataFrame
+                     ) -> pd.DataFrame:
+    """One row per player and game on a roster, with every pre-game feature and the outcomes."""
+    df = roster.expected_minutes(gl, values)
+    df = _player_history(df)
+    df = df.merge(_teammates(df), on=["season", "team_id", "date"], how="left")
+    own = df["expected_mp"].where(~df["available"], 0.0)
+    df["teammate_avail_mp"] = df["avail_mp"] - own  # other available players' expected minutes
+    df["minutes_rank"] = df[df["available"]].groupby(["season", "team_id", "date"])[
+        "expected_mp"].rank(ascending=False)
+
+    games = game_features(team_logs, ELO_PARAMS)
+    tg = team_games(games).merge(
+        games[["game_id", "elo_diff", "home_court", "home_rest_days", "away_rest_days",
+               "home_back_to_back", "away_back_to_back"]], on="game_id")
+    home = tg["is_home"]
+    tg["elo_edge"] = np.where(home, tg["elo_diff"], -tg["elo_diff"]) \
+        + np.where(home, 1, -1) * ELO_PARAMS["home_adv"] * tg["home_court"]
+    tg["rest_days"] = np.where(home, tg["home_rest_days"], tg["away_rest_days"])
+    tg["back_to_back"] = np.where(home, tg["home_back_to_back"], tg["away_back_to_back"])
+    tg["is_home"] = home.astype(int)
+    df = df.merge(tg[["season", "date", "team_id", "opp_id", "is_home", "elo_edge",
+                      "rest_days", "back_to_back"]], on=["season", "date", "team_id"],
+                  how="left")
+    opp = _opponent(team_logs)
+    df = df.merge(opp.drop(columns="pace").rename(columns={"team_id": "opp_id"}),
+                  on=["season", "date", "opp_id"], how="left")
+    pace = opp[["season", "team_id", "date", "pace"]]
+    df = df.merge(pace.rename(columns={"pace": "team_pace"}),
+                  on=["season", "team_id", "date"], how="left")
+    df = df.merge(pace.rename(columns={"team_id": "opp_id", "pace": "opp_pace"}),
+                  on=["season", "opp_id", "date"], how="left")
+    df["game_pace"] = (df["team_pace"] + df["opp_pace"]) / 2
+
+    # pre-season per-minute rates, then blended with the season to date
+    for s in STATS:
+        proj = df[f"{s}_per_100"] * df["team_pace"] / 100 / 48
+        df[f"{s}_rate_proj"] = proj
+        # players without a projection start from the median projected player
+        prior = proj.fillna(proj.groupby(df["season"]).transform("median"))
+        df[f"{s}_rate_blend"] = ((df[f"{s}_td"] + PRIOR_MINUTES[s] * prior)
+                                 / (df["mp_td"] + PRIOR_MINUTES[s]))
+    return df
+
+
+MINUTES_FEATURES = ["expected_mp", "mpg", "mpg_td", "mpg_recent", "games_td",
+                    "start_share_td", "start_share_recent", "missing_mp", "teammate_avail_mp",
+                    "minutes_rank", "elo_edge", "is_home", "rest_days", "back_to_back",
+                    "projected"]
+
+
+def rate_features(stat: str) -> list[str]:
+    own = [f"{stat}_rate_blend", f"{stat}_rate_td", f"{stat}_rate_recent", f"{stat}_rate_proj"]
+    return own + ["usg_pct", "mp_td", "expected_mp", f"opp_allows_{stat}", "game_pace",
+                  "missing_usg_mp", "missing_mp", "elo_edge", "is_home", "back_to_back"]
+
+
+# Kept with the predictions for the situation charts
+CONTEXT = ["missing_usg_mp", "opp_allows_pts", "opp_allows_trb", "opp_allows_ast",
+           "back_to_back", "elo_edge", "is_home", "game_pace"]
+
+
+def props_dataset(first: int, last: int, refresh: bool = False) -> pd.DataFrame:
+    """Player-game rows for ``first``..``last``, cached to ``data/processed``."""
+    cache = PROCESSED_DIR / f"player_games_{first}_{last}.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+    df = player_game_rows(roster.gamelogs(first, last), roster.player_values(first, last),
+                          game_logs(range(2001, last + 1)))
+    names = player_seasons()[["player_id", "season", "player"]].drop_duplicates(
+        ["player_id", "season"])
+    df = df.merge(names, on=["player_id", "season"], how="left")
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache)
+    return df
+
+
+# --- Models -----------------------------------------------------------------
+
+def _trees(loss: str = "squared_error") -> HistGradientBoostingRegressor:
+    return HistGradientBoostingRegressor(loss=loss, max_iter=300, learning_rate=0.05,
+                                         max_depth=5, min_samples_leaf=200,
+                                         l2_regularization=5.0, random_state=0)
+
+
+def fit_dispersion(y: np.ndarray, mu: np.ndarray) -> float:
+    """Negative binomial size ``r`` (Var = mu + mu^2 / r) by maximum likelihood."""
+    mu = np.clip(mu, 1e-3, None)
+
+    def nll(log_r):
+        r = np.exp(log_r)
+        return -np.sum(special.gammaln(y + r) - special.gammaln(r) - special.gammaln(y + 1)
+                       + r * np.log(r / (r + mu)) + y * np.log(mu / (r + mu)))
+
+    return float(np.exp(optimize.minimize_scalar(nll, bounds=(-3, 8), method="bounded").x))
+
+
+MINUTE_BINS = [0, 16, 24, 30, 36, 48]  # dispersion is fit separately in each bin
+
+
+def minute_bin(mp_pred: np.ndarray) -> np.ndarray:
+    return np.clip(np.digitize(mp_pred, MINUTE_BINS[1:-1]), 0, len(MINUTE_BINS) - 2)
+
+
+def prob_over(mu: np.ndarray, r: float | np.ndarray, line: float) -> np.ndarray:
+    """P(stat >= line) for a negative binomial with mean ``mu`` and size ``r``."""
+    mu = np.clip(mu, 1e-6, None)
+    return stats.nbinom.sf(np.ceil(line) - 1, r, r / (r + mu))
+
+
+def fit_predict(df: pd.DataFrame, train: pd.Series, test: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """Fit minutes, rate and dispersion on ``train`` played rows; predict ``test`` rows.
+
+    Returns predictions (minutes, rate, mean and negative binomial size for
+    each stat, plus two baselines) and the fitted sizes, one per stat and
+    predicted-minutes bin: bench players' totals swing more with their minutes.
+    """
+    played = df["mp"] > 0
+    tr, te = df[train & played], df[test & played]
+    keys = ["player_id", "player", "season", "date", "team_id", "opp_id"]
+    out = te[[c for c in keys if c in te] + ["mp", *STATS, *CONTEXT]].copy()
+    minutes = _trees().fit(tr[MINUTES_FEATURES], tr["mp"])
+    out["mp_pred"] = minutes.predict(te[MINUTES_FEATURES]).clip(1, 48)
+    tr_mp = minutes.predict(tr[MINUTES_FEATURES]).clip(1, 48)
+    dispersion = {}
+    for s in STATS:
+        f = rate_features(s)
+        rows = tr[s].notna()
+        rate = _trees("poisson").fit(tr.loc[rows, f], tr.loc[rows, s] / tr.loc[rows, "mp"],
+                                     sample_weight=tr.loc[rows, "mp"])
+        out[f"{s}_rate_pred"] = rate.predict(te[f])
+        out[f"{s}_pred"] = out["mp_pred"] * out[f"{s}_rate_pred"]
+        out[f"{s}_baseline"] = te["expected_mp"] * te[f"{s}_rate_blend"]
+        out[f"{s}_avg"] = (te[f"{s}_td"] / te["games_td"].replace(0, np.nan)).fillna(
+            out[f"{s}_baseline"])
+        mu_tr = tr_mp[rows.to_numpy()] * rate.predict(tr.loc[rows, f])
+        bins_tr, y_tr = minute_bin(tr_mp[rows.to_numpy()]), tr.loc[rows, s].to_numpy()
+        sizes = np.array([fit_dispersion(y_tr[bins_tr == b], mu_tr[bins_tr == b])
+                          for b in range(len(MINUTE_BINS) - 1)])
+        dispersion[s] = sizes
+        out[f"{s}_size"] = sizes[minute_bin(out["mp_pred"].to_numpy())]
+    return out, dispersion
+
+
+def walk_forward(df: pd.DataFrame, first_test: int, last_test: int,
+                 first_train: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Predict each test season from models fit on every earlier season."""
+    first_train = first_train or int(df["season"].min())
+    parts, disp = [], []
+    for s in range(first_test, last_test + 1):
+        train = df["season"].between(first_train, s - 1)
+        out, d = fit_predict(df, train, df["season"] == s)
+        parts.append(out)
+        for stat, sizes in d.items():
+            disp += [{"season": s, "stat": stat, "minutes": f"{lo}-{hi}", "size": r}
+                     for lo, hi, r in zip(MINUTE_BINS[:-1], MINUTE_BINS[1:], sizes)]
+    return pd.concat(parts, ignore_index=True), pd.DataFrame(disp)
+
+
+# --- Evaluation -------------------------------------------------------------
+
+METHODS = {"avg": "Season average so far", "baseline": "Blended rate x expected minutes",
+           "pred": "Model"}
+
+
+def evaluate(preds: pd.DataFrame, by_season: bool = False) -> pd.DataFrame:
+    """MAE of each method for minutes and each stat."""
+    groups = preds["season"] if by_season else pd.Series(0, index=preds.index)
+    rows = []
+    for s, label in {"mp": "Minutes", **STATS}.items():
+        cols = {"pred": "mp_pred"} if s == "mp" else {m: f"{s}_{m}" for m in METHODS}
+        for m, col in cols.items():
+            err = (preds[col] - preds[s]).abs()
+            for g, v in err.groupby(groups).mean().items():
+                rows.append({"stat": label, "method": METHODS[m], "season": g, "mae": v})
+    out = pd.DataFrame(rows)
+    return out if by_season else out.drop(columns="season")
+
+
+def over_calibration(preds: pd.DataFrame, stat: str, bins: int = 10) -> pd.DataFrame:
+    """Predicted vs. actual rate of reaching each line in ``LINES``, pooled, by bin."""
+    parts = []
+    for line in LINES[stat]:
+        p = prob_over(preds[f"{stat}_pred"].to_numpy(), preds[f"{stat}_size"].to_numpy(), line)
+        parts.append(pd.DataFrame({"p": p, "hit": (preds[stat] >= line).astype(int)}))
+    both = pd.concat(parts, ignore_index=True)
+    b = pd.cut(both["p"], np.linspace(0, 1, bins + 1), include_lowest=True)
+    return (both.groupby(b, observed=True)
+            .agg(predicted=("p", "mean"), actual=("hit", "mean"), n=("hit", "size"))
+            .reset_index(drop=True))
+
+
+def interval_coverage(preds: pd.DataFrame, level: float = 0.8) -> pd.DataFrame:
+    """Share of games inside the central ``level`` negative binomial interval, by stat."""
+    rows = []
+    for s, label in STATS.items():
+        r = preds[f"{s}_size"].to_numpy()
+        mu = np.clip(preds[f"{s}_pred"].to_numpy(), 1e-6, None)
+        lo = stats.nbinom.ppf((1 - level) / 2, r, r / (r + mu))
+        hi = stats.nbinom.ppf(1 - (1 - level) / 2, r, r / (r + mu))
+        y = preds[s].to_numpy()
+        rows.append({"stat": label, "coverage": np.mean((y >= lo) & (y <= hi))})
+    return pd.DataFrame(rows)
