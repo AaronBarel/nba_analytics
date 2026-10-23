@@ -216,3 +216,34 @@ def draft_class(year: int, refresh: bool = False) -> pd.DataFrame:
     df = df[df["pick_overall"].notna()].copy()
     df.insert(0, "draft_year", year)
     return df.reset_index(drop=True)
+
+
+def player_game_log(player_id: str, season: int, refresh: bool = False) -> pd.DataFrame:
+    """A player's regular-season games for one season (end year).
+
+    Games missed while on the roster are kept, with the reason ('Inactive',
+    'Did Not Dress', 'Did Not Play', 'Not With Team') in ``status`` and no
+    minutes. ``mp`` is converted from 'mm:ss' to minutes.
+    """
+    try:
+        html = fetch(f"/players/{player_id[0]}/{player_id}/gamelog/{season}", refresh=refresh)
+    except requests.HTTPError as e:  # a few listed player-seasons have no game log page
+        if e.response.status_code == 404:
+            return pd.DataFrame()
+        raise
+    try:
+        df = parse_table(html, "player_game_log_reg")
+    except ValueError:  # no regular-season games (e.g. playoffs only)
+        return pd.DataFrame()
+    df = df[df["team_game_num_season"].notna() & df["date"].notna()].copy()
+    # The reason for a missed game fills the row from the first stat column on,
+    # which is 'is_starter' unless the player never started.
+    first = df["is_starter"] if "is_starter" in df else df["mp"]
+    first = first.astype("string")
+    df["status"] = first.where(first.str.contains("[A-Za-z]", na=False), None)
+    df["started"] = first.eq("*").fillna(False).astype(int)
+    mp = df["mp"].astype("string").where(df["status"].isna()).str.split(":", expand=True)
+    df["mp"] = pd.to_numeric(mp[0], errors="coerce") + pd.to_numeric(mp[1], errors="coerce") / 60
+    df.insert(0, "season", season)
+    df.insert(1, "player_id", player_id)
+    return df.reset_index(drop=True)
