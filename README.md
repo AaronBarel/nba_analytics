@@ -37,6 +37,15 @@ injury report, then prints home win probabilities, projected margins and player 
 saving them under `data/predictions/<date>/`. The models are the ones in notebooks 09 and 10,
 fit on every past season; players listed Out or Doubtful are treated as not playing.
 
+```bash
+uv run python scripts/incentives.py                 # each team's incentive to win today
+```
+
+This simulates the rest of the season, the play-in and the 2027 "3-2-1" lottery with every
+team's actual 2027 first-round holdings (protections and swaps included), and prints what
+winning the next game is worth in draft value and playoff odds (notebook 11). The table is
+saved under `data/predictions/incentives/`.
+
 ## Layout
 
 ```
@@ -47,7 +56,7 @@ src/nba_analytics/
   viz/        shared plotting helpers (team colors)
   live.py     predictions for upcoming games
 notebooks/    reports and visualizations
-scripts/      data backfills
+scripts/      data backfills, live predictions and incentives
 tests/
 ```
 
@@ -65,8 +74,8 @@ tests/
 | [08_gleague_exploration](notebooks/08_gleague_exploration.ipynb) | G League → NBA linking, the G League pathway, how each stat translates to the next NBA season, and whether G League stats improve the projection models |
 | [09_game_outcomes](notebooks/09_game_outcomes.ipynb) | Home win probability and margin from Elo, team ratings, schedule and travel, roster talent, availability and turnover; walk-forward 2015-16 to 2025-26 |
 | [10_player_game_projections](notebooks/10_player_game_projections.ipynb) | Per-game points, rebounds, assists, steals and blocks as projected minutes x per-minute rate with a negative binomial spread; accuracy against season averages and calibration of over probabilities, walk-forward 2015-16 to 2025-26 |
+| [11_incentive_to_win](notebooks/11_incentive_to_win.ipynb) | Lottery odds under the 2015, 2019 and 2027 ("3-2-1") systems, the value of a pick by slot, season simulation, the draft incentive by projected record (2014-15 to 2025-26, replayed under the old and new lotteries), incentives as game-model features, and 2026-27 incentives with actual 2027 pick ownership |
 
 ## Roadmap
 
-- Teams: draft-incentive factor under the 2027 lottery rules
 - Season-to-date scoring of the live predictions
