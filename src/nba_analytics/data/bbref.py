@@ -38,14 +38,17 @@ _last_request = 0.0
 
 
 def fetch(path: str, cache_dir: Path = CACHE_DIR / "bbref", refresh: bool = False,
-          base_url: str = BASE_URL) -> str:
+          base_url: str = BASE_URL, max_age: float | None = None) -> str:
     """Return the HTML for ``path`` (e.g. '/leagues/NBA_2026_advanced.html').
 
     ``base_url`` lets other Sports-Reference sites share the cache logic and the
-    request spacing, which is enforced across all of them.
+    request spacing, which is enforced across all of them. ``max_age`` (hours)
+    re-downloads a cached page older than that, for pages that change.
     """
     global _last_request
     cache_file = cache_dir / path.strip("/").replace("/", "__")
+    if max_age is not None and cache_file.exists():
+        refresh |= time.time() - cache_file.stat().st_mtime > max_age * 3600
     if cache_file.exists() and not refresh:
         return cache_file.read_text()
 
@@ -247,3 +250,103 @@ def player_game_log(player_id: str, season: int, refresh: bool = False) -> pd.Da
     df.insert(0, "season", season)
     df.insert(1, "player_id", player_id)
     return df.reset_index(drop=True)
+
+
+# --- Current season ---------------------------------------------------------
+
+def schedule_months(season: int, max_age: float | None = None) -> list[str]:
+    """Month names with a schedule page for a season (e.g. ['october', ...])."""
+    html = fetch(f"/leagues/NBA_{season}_games.html", max_age=max_age)
+    return list(dict.fromkeys(re.findall(rf"NBA_{season}_games-(\w+)\.html", html)))
+
+
+def schedule_month(season: int, month: str, max_age: float | None = None) -> pd.DataFrame:
+    """One month of the schedule with results so far.
+
+    One row per game: ISO ``date``, ``away`` and ``home`` team ids, points
+    (missing until played), ``arena`` and ``box_score`` (the box score path,
+    once the game is final).
+    """
+    html = fetch(f"/leagues/NBA_{season}_games-{month}.html", max_age=max_age)
+    table = BeautifulSoup(html, "lxml").find("table", id="schedule")
+    records = []
+    for row in table.tbody.find_all("tr"):
+        cells = {c.get("data-stat"): c for c in row.find_all(["th", "td"])}
+        if "home_team_name" not in cells:
+            continue
+        box = cells["box_score_text"].find("a")
+        records.append({
+            "date": pd.to_datetime(cells["date_game"].get_text(strip=True)).strftime("%Y-%m-%d"),
+            "start_time": cells["game_start_time"].get_text(strip=True) or None,
+            "away": TEAM_HREF.search(cells["visitor_team_name"].a["href"]).group(1),
+            "home": TEAM_HREF.search(cells["home_team_name"].a["href"]).group(1),
+            "away_pts": pd.to_numeric(cells["visitor_pts"].get_text(strip=True) or None),
+            "home_pts": pd.to_numeric(cells["home_pts"].get_text(strip=True) or None),
+            "arena": cells["arena_name"].get_text(strip=True) or None,
+            "box_score": box["href"] if box else None,
+        })
+    df = pd.DataFrame.from_records(records)
+    df.insert(0, "season", season)
+    return df
+
+
+def _minutes(mp: pd.Series) -> pd.Series:
+    """'mm:ss' -> minutes."""
+    parts = mp.astype("string").str.split(":", expand=True)
+    return pd.to_numeric(parts[0], errors="coerce") + pd.to_numeric(parts[1], errors="coerce") / 60
+
+
+INACTIVE = re.compile(r"<strong>([A-Z]{3})</strong>((?:(?!<strong>).)*)", re.DOTALL)
+
+
+def box_score(path: str, refresh: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Player rows and team totals for a finished game (e.g. '/boxscores/202610200DET.html').
+
+    Player rows cover everyone listed: ``started`` marks the first five,
+    ``status`` holds the reason for not playing ('Did Not Play', 'Did Not
+    Dress', 'Not With Team', ...) or 'Inactive' for the inactive list. Team
+    totals have one row per team with the box score counts.
+    """
+    html = fetch(path, refresh=refresh)
+    soup = BeautifulSoup(html, "lxml")
+    players, totals = [], []
+    for team in dict.fromkeys(re.findall(r'id="box-([A-Z]{3})-game-basic"', html)):
+        df = parse_table(html, f"box-{team}-game-basic")
+        df = df[df["player_id"].notna()].reset_index(drop=True)
+        df["team_id"] = team
+        df["started"] = (df.index < 5).astype(int)
+        df["status"] = df.get("reason")
+        df["mp"] = _minutes(df["mp"])
+        players.append(df)
+        foot = soup.find("table", id=f"box-{team}-game-basic").tfoot
+        row = {c["data-stat"]: c.get_text(strip=True) for c in foot.find_all(["th", "td"])
+               if c.get("data-stat")}
+        totals.append({"team_id": team, **{k: pd.to_numeric(v, errors="coerce")
+                                           for k, v in row.items()}})
+    block = html[html.find("Inactive:"):]
+    block = block[:block.find("</div>")]
+    for team, links in INACTIVE.findall(block):
+        ids = PLAYER_HREF.findall(links)
+        players.append(pd.DataFrame({"player_id": ids, "team_id": team, "started": 0,
+                                     "status": "Inactive", "mp": float("nan")}))
+    return pd.concat(players, ignore_index=True), pd.DataFrame(totals)
+
+
+def team_roster(team_id: str, season: int, max_age: float | None = None) -> pd.DataFrame:
+    """A team's current roster: ``player_id``, ``player``, ``pos``, experience."""
+    df = parse_table(fetch(f"/teams/{team_id}/{season}.html", max_age=max_age), "roster")
+    df = df[["player_id", "player", "pos", "years_experience"]].copy()
+    df["player"] = df["player"].str.replace(r"\s*\(TW\)$", "", regex=True)  # two-way tag
+    df.insert(0, "team_id", team_id)
+    return df
+
+
+INJURY_STATUS = re.compile(r"^(Out For Season|Out|Day To Day)")
+
+
+def injury_list(max_age: float | None = None) -> pd.DataFrame:
+    """Basketball-Reference's current injury list: player, team, status and note."""
+    df = parse_table(fetch("/friv/injuries.fcgi", max_age=max_age), "injuries")
+    df["status"] = df["note"].str.extract(INJURY_STATUS, expand=False)
+    df["date_update"] = pd.to_datetime(df["date_update"]).dt.strftime("%Y-%m-%d")
+    return df[["player_id", "player", "team_id", "date_update", "status", "note"]]
