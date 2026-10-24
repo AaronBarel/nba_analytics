@@ -5,8 +5,8 @@
 
 Downloads new box scores, the playing teams' rosters and the latest official
 injury report (a few minutes the first time each day), prints win
-probabilities and the top projected scorers, and saves both tables under
-``data/predictions/<date>/``.
+probabilities, margins, totals and the top projected scorers, and saves both
+tables under ``data/predictions/<date>/``.
 """
 
 import sys
@@ -33,8 +33,10 @@ def main(target: str | None) -> None:
     out = games.assign(
         matchup=games["away"] + games["neutral"].map({True: " vs ", False: " @ "}) + games["home"],
         home_win=(100 * games["home_win_prob"]).round(1),
-        margin=games["home_margin"].round(1), elo=(100 * games["elo_prob"]).round(1))
-    print(out[["start_time", "matchup", "home_win", "margin", "elo"]].to_string(index=False))
+        margin=games["home_margin"].round(1), total=games["total_pred"].round(1),
+        elo=(100 * games["elo_prob"]).round(1))
+    print(out[["start_time", "matchup", "home_win", "margin", "total", "elo"]]
+          .to_string(index=False))
     missed = live.unmatched(data["report"][data["report"]["game_date"] == target], data["rosters"])
     if len(missed):
         print("\nInjury report names not on a roster:", ", ".join(missed["player"]))
@@ -46,6 +48,7 @@ def main(target: str | None) -> None:
         "pts": top["pts_pred"].round(1),
         "80% range": top["pts_lo"].astype(int).astype(str) + "-" + top["pts_hi"].astype(int).astype(str),
         "reb": top["trb_pred"].round(1), "ast": top["ast_pred"].round(1),
+        "3pm": top["fg3_pred"].round(1),
     }).to_string(index=False))
 
 

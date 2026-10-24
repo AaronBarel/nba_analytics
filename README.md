@@ -73,8 +73,9 @@ tests/
 | [07_season_projections](notebooks/07_season_projections.ipynb) | Next-season games, minutes, per-100 stats, TS%, usage and BPM: Marcel baseline vs. residual model, walk-forward 2013-14 to 2025-26; aging curves; 2026-27 projections |
 | [08_gleague_exploration](notebooks/08_gleague_exploration.ipynb) | G League → NBA linking, the G League pathway, how each stat translates to the next NBA season, and whether G League stats improve the projection models |
 | [09_game_outcomes](notebooks/09_game_outcomes.ipynb) | Home win probability and margin from Elo, team ratings, schedule and travel, roster talent, availability and turnover; walk-forward 2015-16 to 2025-26 |
-| [10_player_game_projections](notebooks/10_player_game_projections.ipynb) | Per-game points, rebounds, assists, steals and blocks as projected minutes x per-minute rate with a negative binomial spread; accuracy against season averages and calibration of over probabilities, walk-forward 2015-16 to 2025-26 |
+| [10_player_game_projections](notebooks/10_player_game_projections.ipynb) | Per-game points, rebounds, assists, steals, blocks and 3-pointers made as projected minutes x per-minute rate with a negative binomial spread; accuracy against season averages and calibration of over probabilities, walk-forward 2015-16 to 2025-26 |
 | [11_incentive_to_win](notebooks/11_incentive_to_win.ipynb) | Lottery odds under the 2015, 2019 and 2027 ("3-2-1") systems, the value of a pick by slot, season simulation, the draft incentive by projected record (2014-15 to 2025-26, replayed under the old and new lotteries), incentives as game-model features, and 2026-27 incentives with actual 2027 pick ownership |
+| [12_margin_and_total](notebooks/12_margin_and_total.ipynb) | Probability of any final home margin or combined score: a ridge margin with a normal reshaped for close finishes, and a total built from the teams' ratings plus a ridge on what they miss; accuracy and calibration of over probabilities, walk-forward 2015-16 to 2025-26 |
 
 ## Roadmap
 
