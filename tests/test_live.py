@@ -88,7 +88,7 @@ def test_upcoming_rows_get_history_from_played_games():
         "season": 2027, "player_id": "a", "team_id": "BOS",
         "date": ["2026-10-20", "2026-10-22", "2026-10-24"], "mp": [30.0, 20.0, np.nan],
         "started": [1, 0, 0], "available": True, "pts": [30.0, 10.0, np.nan],
-        "trb": 5.0, "ast": 2.0, "stl": 1.0, "blk": 0.0})
+        "trb": 5.0, "ast": 2.0, "stl": 1.0, "blk": 0.0, "fg3": 1.0})
     values = pd.DataFrame({"player_id": ["a"], "season": [2027], "bpm": [1.0], "mpg": [30.0]})
     h = _player_history(expected_minutes(df, values))
     last = h.iloc[-1]

@@ -29,7 +29,7 @@ def test_player_history_uses_only_earlier_games():
     df = pd.DataFrame({
         "season": 2025, "player_id": "a", "date": ["2025-01-01", "2025-01-03", "2025-01-05"],
         "mp": [30.0, 0.0, 20.0], "started": [1, 0, 0],
-        "pts": [30.0, None, 10.0], "trb": 5.0, "ast": 2.0, "stl": 1.0, "blk": 0.0,
+        "pts": [30.0, None, 10.0], "trb": 5.0, "ast": 2.0, "stl": 1.0, "blk": 0.0, "fg3": 2.0,
     })
     h = _player_history(df)
     assert pd.isna(h.loc[0, "pts_rate_td"]) and h.loc[0, "games_td"] == 0
