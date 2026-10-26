@@ -62,3 +62,30 @@ def test_shrunk_fg3_pct_without_history_is_the_league_rate():
     out = shrunk_fg3_pct(totals, [2025]).set_index("player_id")["fg3_pct_prior"]
     assert "new" not in out.index  # callers fill players without history with FG3_PCT
     assert out["a"] == pytest.approx(0.36)
+
+
+def test_blend_threes_separates_attempts_from_accuracy():
+    from nba_analytics.players.props import FG3A_PRIOR_MINUTES, blend_threes
+
+    rows = pd.DataFrame({"fg3_td": [0.0, 5.0], "fg3a_td": [0.0, 8.0], "mp_td": [0.0, 100.0],
+                         "fg3a_rate_proj": 0.06, "fg3_pct_prior": 0.32,
+                         "fg3_pct_weight": 600.0})
+    out = blend_threes(rows)
+    # no games yet: the pre-season attempt rate at the pre-season 3P%
+    assert out.loc[0, "fg3_rate_blend"] == pytest.approx(0.06 * 0.32)
+    att = (8 + FG3A_PRIOR_MINUTES * 0.06) / (100 + FG3A_PRIOR_MINUTES)
+    pct = (5 + 600 * 0.32) / (8 + 600)
+    assert out.loc[1, "fg3a_rate_blend"] == pytest.approx(att)
+    assert out.loc[1, "fg3_pct_blend"] == pytest.approx(pct)
+    assert out.loc[1, "fg3_rate_blend"] == pytest.approx(att * pct)
+    # 5 of 8 barely moves the percentage
+    assert out.loc[1, "fg3_pct_blend"] < 0.33
+
+
+def test_shrunk_fg3_pct_weight_counts_past_attempts():
+    from nba_analytics.players.props import FG3_PRIOR_ATTEMPTS, shrunk_fg3_pct
+
+    totals = pd.DataFrame({"season": [2023, 2024], "player_id": "a", "fg3": [30.0, 40.0],
+                           "fg3a": [100.0, 120.0]})
+    out = shrunk_fg3_pct(totals, [2025]).iloc[0]
+    assert out["fg3_pct_weight"] == pytest.approx(220 + FG3_PRIOR_ATTEMPTS)

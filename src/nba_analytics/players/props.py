@@ -37,7 +37,7 @@ STATS = {"pts": "Points", "trb": "Rebounds", "ast": "Assists", "stl": "Steals",
 RECENT_GAMES = 5
 # Minutes of the pre-season rate blended into the season-to-date rate (the
 # season projection's regression minutes, which were tuned on 2009-2013)
-PRIOR_MINUTES = {"pts": 250, "trb": 100, "ast": 100, "stl": 500, "blk": 250, "fg3": 250}
+PRIOR_MINUTES = {"pts": 250, "trb": 100, "ast": 100, "stl": 500, "blk": 250}
 # Opponent counts that measure what a defense allows for each stat
 ALLOWED = {"pts": "opp_pts", "trb": "opp_trb", "ast": "opp_ast", "stl": "tov",
            "blk": "opp_blk", "fg3": "opp_fg3"}
@@ -49,7 +49,13 @@ LINES = {"pts": [10, 15, 20, 25, 30], "trb": [4, 6, 8, 10, 12], "ast": [2, 4, 6,
 FG3_PCT = 0.36
 FG3_SEASONS = 3
 FG3_PRIOR_ATTEMPTS = 300
-FG3_PRIOR = (FG3_SEASONS, FG3_PRIOR_ATTEMPTS)  # stored with fitted models to spot stale caches
+# In season, 3PM per minute is the attempt rate times 3P%, blended apart: attempts
+# with FG3A_PRIOR_MINUTES of the projected rate (volume settles fast), 3P% by adding
+# this season's makes and attempts to the pooled history (accuracy settles slowly)
+# (25-50 minutes scored best for this-game 3PM given minutes, 2016-2026)
+FG3A_PRIOR_MINUTES = 50
+# stored with fitted models to spot stale caches
+FG3_PRIOR = (FG3_SEASONS, FG3_PRIOR_ATTEMPTS, FG3A_PRIOR_MINUTES)
 
 
 # --- Features ---------------------------------------------------------------
@@ -57,6 +63,7 @@ FG3_PRIOR = (FG3_SEASONS, FG3_PRIOR_ATTEMPTS)  # stored with fitted models to sp
 def shrunk_fg3_pct(totals: pd.DataFrame, seasons) -> pd.DataFrame:
     """Each player's pre-season 3P% for each of ``seasons``: makes and attempts over the
     previous FG3_SEASONS seasons plus FG3_PRIOR_ATTEMPTS at last season's league rate.
+    ``fg3_pct_weight`` is those attempts, the prior's weight against this season's.
 
     ``totals`` has one row per player and season (``fg3``, ``fg3a``).
     """
@@ -67,8 +74,20 @@ def shrunk_fg3_pct(totals: pd.DataFrame, seasons) -> pd.DataFrame:
         past = totals[totals["season"].between(season - FG3_SEASONS, season - 1)]
         g = past.groupby("player_id")[["fg3", "fg3a"]].sum()
         pct = (g["fg3"] + FG3_PRIOR_ATTEMPTS * league) / (g["fg3a"] + FG3_PRIOR_ATTEMPTS)
-        out.append(pct.rename("fg3_pct_prior").reset_index().assign(season=season))
-    return pd.concat(out, ignore_index=True)[["season", "player_id", "fg3_pct_prior"]]
+        out.append(pd.DataFrame({"fg3_pct_prior": pct,
+                                 "fg3_pct_weight": g["fg3a"] + FG3_PRIOR_ATTEMPTS})
+                   .reset_index().assign(season=season))
+    return pd.concat(out, ignore_index=True)[["season", "player_id", "fg3_pct_prior",
+                                              "fg3_pct_weight"]]
+
+
+def blend_threes(df: pd.DataFrame) -> pd.DataFrame:
+    """Blended 3PA per minute, 3P% and their product, the 3PM per-minute rate."""
+    att = ((df["fg3a_td"] + FG3A_PRIOR_MINUTES * df["fg3a_rate_proj"])
+           / (df["mp_td"] + FG3A_PRIOR_MINUTES))
+    pct = ((df["fg3_td"] + df["fg3_pct_weight"] * df["fg3_pct_prior"])
+           / (df["fg3a_td"] + df["fg3_pct_weight"]))
+    return df.assign(fg3a_rate_blend=att, fg3_pct_blend=pct, fg3_rate_blend=att * pct)
 
 
 def fg3_pct_prior(seasons) -> pd.DataFrame:
@@ -117,6 +136,8 @@ def _player_history(df: pd.DataFrame) -> pd.DataFrame:
     for s in STATS:
         out[f"{s}_td"] = g[s].transform(lambda x: x.fillna(0).cumsum()) - df[s].fillna(0)
         out[f"{s}_rate_td"] = out[f"{s}_td"] / out["mp_td"].replace(0, np.nan)
+    if "fg3a" in df:
+        out["fg3a_td"] = g["fg3a"].transform(lambda x: x.fillna(0).cumsum()) - df["fg3a"].fillna(0)
     return pd.concat([df, out], axis=1)
 
 
@@ -187,15 +208,18 @@ def player_game_rows(gl: pd.DataFrame, values: pd.DataFrame, team_logs: pd.DataF
         fg3_pct = fg3_pct_prior(df["season"].unique())
     df = df.merge(fg3_pct, on=["season", "player_id"], how="left")
     df["fg3_pct_prior"] = df["fg3_pct_prior"].fillna(FG3_PCT)
+    df["fg3_pct_weight"] = df["fg3_pct_weight"].fillna(FG3_PRIOR_ATTEMPTS)
+    # players without a projection start from the median projected player
+    median = lambda x: x.fillna(x.groupby(df["season"]).transform("median"))
+    df["fg3a_rate_proj"] = median(df["fg3a_per_100"] * df["team_pace"] / 100 / 48)
     for s in STATS:
         per_100 = df["fg3a_per_100"] * df["fg3_pct_prior"] if s == "fg3" else df[f"{s}_per_100"]
         proj = per_100 * df["team_pace"] / 100 / 48
         df[f"{s}_rate_proj"] = proj
-        # players without a projection start from the median projected player
-        prior = proj.fillna(proj.groupby(df["season"]).transform("median"))
-        df[f"{s}_rate_blend"] = ((df[f"{s}_td"] + PRIOR_MINUTES[s] * prior)
-                                 / (df["mp_td"] + PRIOR_MINUTES[s]))
-    return df
+        if s != "fg3":
+            df[f"{s}_rate_blend"] = ((df[f"{s}_td"] + PRIOR_MINUTES[s] * median(proj))
+                                     / (df["mp_td"] + PRIOR_MINUTES[s]))
+    return blend_threes(df)
 
 
 MINUTES_FEATURES = ["expected_mp", "mpg", "mpg_td", "mpg_recent", "games_td",
@@ -206,6 +230,8 @@ MINUTES_FEATURES = ["expected_mp", "mpg", "mpg_td", "mpg_recent", "games_td",
 
 def rate_features(stat: str) -> list[str]:
     own = [f"{stat}_rate_blend", f"{stat}_rate_td", f"{stat}_rate_recent", f"{stat}_rate_proj"]
+    if stat == "fg3":
+        own += ["fg3a_rate_blend", "fg3_pct_blend"]
     return own + ["usg_pct", "mp_td", "expected_mp", f"opp_allows_{stat}", "game_pace",
                   "missing_usg_mp", "missing_mp", "elo_edge", "is_home", "back_to_back"]
 
@@ -221,7 +247,8 @@ def props_dataset(first: int, last: int, refresh: bool = False) -> pd.DataFrame:
     if cache.exists() and not refresh:
         df = pd.read_parquet(cache)
         # else built before a stat or the 3P% prior was added
-        if all(f"{s}_rate_blend" in df for s in STATS) and "fg3_pct_prior" in df:
+        if all(f"{s}_rate_blend" in df for s in STATS) and "fg3_pct_blend" in df \
+                and df.attrs.get("fg3_prior") == list(FG3_PRIOR):
             return df
     df = player_game_rows(roster.gamelogs(first, last), roster.player_values(first, last),
                           game_logs(range(2001, last + 1)))
@@ -229,6 +256,7 @@ def props_dataset(first: int, last: int, refresh: bool = False) -> pd.DataFrame:
         ["player_id", "season"])
     df = df.merge(names, on=["player_id", "season"], how="left")
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    df.attrs["fg3_prior"] = list(FG3_PRIOR)
     df.to_parquet(cache)
     return df
 
