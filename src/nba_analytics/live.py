@@ -23,7 +23,7 @@ from scipy import stats
 from nba_analytics.config import PROCESSED_DIR
 from nba_analytics.data import bbref, injuries
 from nba_analytics.players import props
-from nba_analytics.teams import games, roster
+from nba_analytics.teams import games, roster, totals
 from nba_analytics.teams.net_rating import franchise, game_logs, possessions
 from nba_analytics.teams.schedule import NEUTRAL_ARENAS, NEUTRAL_DATES
 
@@ -225,17 +225,37 @@ def _props_models(last: int):
     """Per-game models fit on every season through ``last``, cached."""
     path = PROCESSED_DIR / f"props_models_{FIRST_TRAIN}_{last}.pkl"
     if path.exists():
-        return pickle.loads(path.read_bytes())
+        models = pickle.loads(path.read_bytes())
+        if set(models["rates"]) == set(props.STATS):
+            return models
     df = props.props_dataset(FIRST_TRAIN, last)
     models = props.fit(df[df["mp"] > 0])
     path.write_bytes(pickle.dumps(models))
     return models
 
 
+def totals_models(last: int) -> dict:
+    """Margin and total distribution models fit on every season through ``last``, cached.
+
+    Pass ``models["close_weights"]`` to ``totals.prob_margin_over``.
+    """
+    path = PROCESSED_DIR / f"totals_models_{FIRST_TRAIN}_{last}.pkl"
+    if path.exists():
+        return pickle.loads(path.read_bytes())
+    models = totals.fit(totals.total_features(games.game_dataset(FIRST_TRAIN, last)))
+    path.write_bytes(pickle.dumps(models))
+    return models
+
+
 def predict_games(data: dict) -> pd.DataFrame:
-    """Home win probability (logistic) and margin (ridge) for the slate."""
+    """Home win probability (logistic), margin (ridge) and total for the slate.
+
+    ``margin_sd``, ``total_pred`` and ``total_sd`` give the margin and total
+    distributions (``totals.prob_margin_over`` and ``totals.prob_total_over``).
+    """
     season = data["season"]
     rows = games.game_rows(data["logs"], data["gl"], data["values"], season)
+    rows = totals.total_features(rows)  # league averages need the whole season so far
     rows = rows[rows["date"] == data["target"]]
     train = games.game_dataset(FIRST_TRAIN, season - 1)
     use = {k: games.MODELS[k] for k in ["Logistic regression", "Ridge (margin)"]}
@@ -247,6 +267,9 @@ def predict_games(data: dict) -> pd.DataFrame:
     out["home_win_prob"] = pred["Logistic regression"].to_numpy()
     out["home_margin"] = pred["Ridge (margin) pred"].to_numpy()
     out["margin_win_prob"] = pred["Ridge (margin)"].to_numpy()
+    dist = totals.predict(totals_models(season - 1), rows)
+    for c in ["margin_sd", "total_pred", "total_sd"]:
+        out[c] = dist[c].to_numpy()
     start = data["slate"].set_index(["home", "away"])["start_time"]
     out["start_time"] = [start.get((h, a), start.get((a, h))) for h, a in
                          zip(out["home"], out["away"])]

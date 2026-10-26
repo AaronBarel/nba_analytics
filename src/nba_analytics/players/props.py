@@ -1,4 +1,4 @@
-"""Per-game player projections (P4): points, rebounds, assists, steals and blocks.
+"""Per-game player projections (P4): points, rebounds, assists, steals, blocks and threes.
 
 A stat's expected value is expected minutes times an expected per-minute rate,
 each from its own boosted-tree model; a negative binomial around that mean
@@ -30,16 +30,18 @@ from nba_analytics.teams.games import ELO_PARAMS, blended_counts, game_features,
 from nba_analytics.teams.net_rating import game_logs
 
 STATS = {"pts": "Points", "trb": "Rebounds", "ast": "Assists", "stl": "Steals",
-         "blk": "Blocks"}
+         "blk": "Blocks", "fg3": "3-pointers"}
 RECENT_GAMES = 5
 # Minutes of the pre-season rate blended into the season-to-date rate (the
 # season projection's regression minutes, which were tuned on 2009-2013)
-PRIOR_MINUTES = {"pts": 250, "trb": 100, "ast": 100, "stl": 500, "blk": 250}
+PRIOR_MINUTES = {"pts": 250, "trb": 100, "ast": 100, "stl": 500, "blk": 250, "fg3": 250}
 # Opponent counts that measure what a defense allows for each stat
 ALLOWED = {"pts": "opp_pts", "trb": "opp_trb", "ast": "opp_ast", "stl": "tov",
-           "blk": "opp_blk"}
+           "blk": "opp_blk", "fg3": "opp_fg3"}
 LINES = {"pts": [10, 15, 20, 25, 30], "trb": [4, 6, 8, 10, 12], "ast": [2, 4, 6, 8, 10],
-         "stl": [1, 2, 3], "blk": [1, 2, 3]}
+         "stl": [1, 2, 3], "blk": [1, 2, 3], "fg3": [1, 2, 3, 4, 5]}
+# Season projections have 3PA but not 3PM; projected makes use a league-average 3P%
+FG3_PCT = 0.36
 
 
 # --- Features ---------------------------------------------------------------
@@ -141,7 +143,8 @@ def player_game_rows(gl: pd.DataFrame, values: pd.DataFrame, team_logs: pd.DataF
 
     # pre-season per-minute rates, then blended with the season to date
     for s in STATS:
-        proj = df[f"{s}_per_100"] * df["team_pace"] / 100 / 48
+        per_100 = df["fg3a_per_100"] * FG3_PCT if s == "fg3" else df[f"{s}_per_100"]
+        proj = per_100 * df["team_pace"] / 100 / 48
         df[f"{s}_rate_proj"] = proj
         # players without a projection start from the median projected player
         prior = proj.fillna(proj.groupby(df["season"]).transform("median"))
@@ -171,7 +174,9 @@ def props_dataset(first: int, last: int, refresh: bool = False) -> pd.DataFrame:
     """Player-game rows for ``first``..``last``, cached to ``data/processed``."""
     cache = PROCESSED_DIR / f"player_games_{first}_{last}.parquet"
     if cache.exists() and not refresh:
-        return pd.read_parquet(cache)
+        df = pd.read_parquet(cache)
+        if all(f"{s}_rate_blend" in df for s in STATS):  # else built before a stat was added
+            return df
     df = player_game_rows(roster.gamelogs(first, last), roster.player_values(first, last),
                           game_logs(range(2001, last + 1)))
     names = player_seasons()[["player_id", "season", "player"]].drop_duplicates(
