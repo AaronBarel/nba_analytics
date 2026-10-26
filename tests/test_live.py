@@ -134,3 +134,17 @@ def test_totals_models_refits_a_stale_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(totals, "fit", lambda train: fresh)
     assert live.totals_models(2026) == fresh
     assert pickle.loads(path.read_bytes()) == fresh
+
+
+def test_props_models_refit_when_the_threes_prior_changed(monkeypatch, tmp_path):
+    import pickle
+
+    from nba_analytics.players import props
+
+    monkeypatch.setattr(live, "PROCESSED_DIR", tmp_path)
+    path = tmp_path / f"props_models_{live.FIRST_TRAIN}_2026.pkl"
+    path.write_bytes(pickle.dumps({"rates": dict.fromkeys(props.STATS)}))  # league-rate prior
+    fresh = {"rates": dict.fromkeys(props.STATS), "fg3_prior": props.FG3_PRIOR}
+    monkeypatch.setattr(props, "props_dataset", lambda first, last: pd.DataFrame({"mp": [30.0]}))
+    monkeypatch.setattr(props, "fit", lambda train: fresh)
+    assert live._props_models(2026) == fresh
