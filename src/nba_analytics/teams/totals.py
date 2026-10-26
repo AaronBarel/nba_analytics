@@ -24,6 +24,7 @@ from scipy import optimize, stats
 from nba_analytics.teams import games
 
 SD_SEASONS = 2
+MODEL_KEYS = ("margin", "total", "margin_sd", "margin_resid_sd", "total_sd", "close_weights")
 RELATIVE = ["pace", "off_rtg", "def_rtg", "efg", "opp_efg", "ft_rate", "opp_ft_rate",
             "tov_pct", "opp_tov_pct", "orb_pct", "drb_pct"]
 SITUATION = ["home_court", "home_games_played", "home_rest_days", "away_rest_days",

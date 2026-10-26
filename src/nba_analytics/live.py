@@ -241,7 +241,9 @@ def totals_models(last: int) -> dict:
     """
     path = PROCESSED_DIR / f"totals_models_{FIRST_TRAIN}_{last}.pkl"
     if path.exists():
-        return pickle.loads(path.read_bytes())
+        models = pickle.loads(path.read_bytes())
+        if set(models) == set(totals.MODEL_KEYS):
+            return models
     models = totals.fit(totals.total_features(games.game_dataset(FIRST_TRAIN, last)))
     path.write_bytes(pickle.dumps(models))
     return models
