@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 
 from nba_analytics.players.props import fit_dispersion, prob_over
@@ -36,3 +37,28 @@ def test_player_history_uses_only_earlier_games():
     assert h.loc[2, "games_td"] == 1 and h.loc[2, "mpg_td"] == 30  # the DNP game is skipped
     assert h.loc[2, "pts_rate_td"] == 1.0 and h.loc[2, "pts_rate_recent"] == 1.0
     assert h.loc[2, "start_share_td"] == 1.0
+
+
+def test_shrunk_fg3_pct_pools_the_last_three_seasons_toward_the_league():
+    from nba_analytics.players.props import FG3_PRIOR_ATTEMPTS, shrunk_fg3_pct
+
+    totals = pd.DataFrame({
+        "season": [2021, 2022, 2023, 2024, 2025, 2022, 2023, 2024],
+        "player_id": ["a"] * 5 + ["b"] * 3,
+        "fg3": [999, 30, 40, 50, 0, 100, 100, 100],   # 2021 is too old, 2025 is the season itself
+        "fg3a": [999, 100, 100, 200, 50, 250, 250, 250]})
+    out = shrunk_fg3_pct(totals, [2025]).set_index("player_id")["fg3_pct_prior"]
+    league_2024 = (50 + 100) / (200 + 250)
+    k = FG3_PRIOR_ATTEMPTS
+    assert out["a"] == pytest.approx((30 + 40 + 50 + k * league_2024) / (400 + k))
+    assert out["b"] == pytest.approx((300 + k * league_2024) / (750 + k))
+
+
+def test_shrunk_fg3_pct_without_history_is_the_league_rate():
+    from nba_analytics.players.props import shrunk_fg3_pct
+
+    totals = pd.DataFrame({"season": [2024, 2025], "player_id": ["a", "new"],
+                           "fg3": [36.0, 5.0], "fg3a": [100.0, 10.0]})
+    out = shrunk_fg3_pct(totals, [2025]).set_index("player_id")["fg3_pct_prior"]
+    assert "new" not in out.index  # callers fill players without history with FG3_PCT
+    assert out["a"] == pytest.approx(0.36)

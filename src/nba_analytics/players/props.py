@@ -8,7 +8,9 @@ models are fit and scored on games the player played.
 
 Inputs per player and game:
 
-* Pre-season projections (P2): minutes per game, per-100 rates, usage.
+* Pre-season projections (P2): minutes per game, per-100 rates, usage. Projected
+  3-pointers made are projected attempts times the player's 3P% over the last
+  three seasons, shrunk toward the league rate.
 * Season to date and last five games: minutes, per-minute rates, starts.
 * Teammates: expected minutes and usage of absent teammates.
 * Opponent: what it allows per possession for each stat, relative to the
@@ -24,6 +26,7 @@ from scipy import optimize, special, stats
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 from nba_analytics.config import PROCESSED_DIR
+from nba_analytics.data.bbref import player_season_table
 from nba_analytics.players.projections import player_seasons
 from nba_analytics.teams import roster
 from nba_analytics.teams.games import ELO_PARAMS, blended_counts, game_features, team_games
@@ -40,11 +43,46 @@ ALLOWED = {"pts": "opp_pts", "trb": "opp_trb", "ast": "opp_ast", "stl": "tov",
            "blk": "opp_blk", "fg3": "opp_fg3"}
 LINES = {"pts": [10, 15, 20, 25, 30], "trb": [4, 6, 8, 10, 12], "ast": [2, 4, 6, 8, 10],
          "stl": [1, 2, 3], "blk": [1, 2, 3], "fg3": [1, 2, 3, 4, 5]}
-# Season projections have 3PA but not 3PM; projected makes use a league-average 3P%
+# Season projections have 3PA but not 3PM: projected makes use the player's 3P% over
+# the last FG3_SEASONS seasons with FG3_PRIOR_ATTEMPTS league-rate attempts added
+# (best next-season log loss on 2012-2026); players with no history get FG3_PCT
 FG3_PCT = 0.36
+FG3_SEASONS = 3
+FG3_PRIOR_ATTEMPTS = 300
+FG3_PRIOR = (FG3_SEASONS, FG3_PRIOR_ATTEMPTS)  # stored with fitted models to spot stale caches
 
 
 # --- Features ---------------------------------------------------------------
+
+def shrunk_fg3_pct(totals: pd.DataFrame, seasons) -> pd.DataFrame:
+    """Each player's pre-season 3P% for each of ``seasons``: makes and attempts over the
+    previous FG3_SEASONS seasons plus FG3_PRIOR_ATTEMPTS at last season's league rate.
+
+    ``totals`` has one row per player and season (``fg3``, ``fg3a``).
+    """
+    out = []
+    for season in seasons:
+        last = totals[totals["season"] == season - 1]
+        league = last["fg3"].sum() / last["fg3a"].sum()
+        past = totals[totals["season"].between(season - FG3_SEASONS, season - 1)]
+        g = past.groupby("player_id")[["fg3", "fg3a"]].sum()
+        pct = (g["fg3"] + FG3_PRIOR_ATTEMPTS * league) / (g["fg3a"] + FG3_PRIOR_ATTEMPTS)
+        out.append(pct.rename("fg3_pct_prior").reset_index().assign(season=season))
+    return pd.concat(out, ignore_index=True)[["season", "player_id", "fg3_pct_prior"]]
+
+
+def fg3_pct_prior(seasons) -> pd.DataFrame:
+    """``shrunk_fg3_pct`` from Basketball-Reference season totals (traded players' combined
+    row, which comes first)."""
+    seasons = sorted(set(seasons))
+    years = range(seasons[0] - FG3_SEASONS, seasons[-1])
+    totals = pd.concat([player_season_table(y, "totals").drop_duplicates("player_id")
+                        [["season", "player_id", "fg3", "fg3a"]] for y in years],
+                       ignore_index=True)
+    for c in ["fg3", "fg3a"]:
+        totals[c] = pd.to_numeric(totals[c], errors="coerce").fillna(0.0)
+    return shrunk_fg3_pct(totals, seasons)
+
 
 def _player_history(df: pd.DataFrame) -> pd.DataFrame:
     """Season-to-date and last-five-game minutes, starts and per-minute rates.
@@ -107,9 +145,12 @@ def _opponent(team_logs: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def player_game_rows(gl: pd.DataFrame, values: pd.DataFrame, team_logs: pd.DataFrame
-                     ) -> pd.DataFrame:
-    """One row per player and game on a roster, with every pre-game feature and the outcomes."""
+def player_game_rows(gl: pd.DataFrame, values: pd.DataFrame, team_logs: pd.DataFrame,
+                     fg3_pct: pd.DataFrame | None = None) -> pd.DataFrame:
+    """One row per player and game on a roster, with every pre-game feature and the outcomes.
+
+    ``fg3_pct`` is ``fg3_pct_prior`` for the seasons in ``gl``, loaded when not given.
+    """
     df = roster.expected_minutes(gl, values)
     df = _player_history(df)
     df = df.merge(_teammates(df), on=["season", "team_id", "date"], how="left")
@@ -142,8 +183,12 @@ def player_game_rows(gl: pd.DataFrame, values: pd.DataFrame, team_logs: pd.DataF
     df["game_pace"] = (df["team_pace"] + df["opp_pace"]) / 2
 
     # pre-season per-minute rates, then blended with the season to date
+    if fg3_pct is None:
+        fg3_pct = fg3_pct_prior(df["season"].unique())
+    df = df.merge(fg3_pct, on=["season", "player_id"], how="left")
+    df["fg3_pct_prior"] = df["fg3_pct_prior"].fillna(FG3_PCT)
     for s in STATS:
-        per_100 = df["fg3a_per_100"] * FG3_PCT if s == "fg3" else df[f"{s}_per_100"]
+        per_100 = df["fg3a_per_100"] * df["fg3_pct_prior"] if s == "fg3" else df[f"{s}_per_100"]
         proj = per_100 * df["team_pace"] / 100 / 48
         df[f"{s}_rate_proj"] = proj
         # players without a projection start from the median projected player
@@ -175,7 +220,8 @@ def props_dataset(first: int, last: int, refresh: bool = False) -> pd.DataFrame:
     cache = PROCESSED_DIR / f"player_games_{first}_{last}.parquet"
     if cache.exists() and not refresh:
         df = pd.read_parquet(cache)
-        if all(f"{s}_rate_blend" in df for s in STATS):  # else built before a stat was added
+        # else built before a stat or the 3P% prior was added
+        if all(f"{s}_rate_blend" in df for s in STATS) and "fg3_pct_prior" in df:
             return df
     df = player_game_rows(roster.gamelogs(first, last), roster.player_values(first, last),
                           game_logs(range(2001, last + 1)))
@@ -228,7 +274,7 @@ def fit(train: pd.DataFrame) -> dict:
     """
     minutes = _trees().fit(train[MINUTES_FEATURES], train["mp"])
     tr_mp = minutes.predict(train[MINUTES_FEATURES]).clip(1, 48)
-    models = {"minutes": minutes, "rates": {}, "sizes": {}}
+    models = {"minutes": minutes, "rates": {}, "sizes": {}, "fg3_prior": FG3_PRIOR}
     for s in STATS:
         f = rate_features(s)
         rows = train[s].notna()

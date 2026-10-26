@@ -226,7 +226,8 @@ def _props_models(last: int):
     path = PROCESSED_DIR / f"props_models_{FIRST_TRAIN}_{last}.pkl"
     if path.exists():
         models = pickle.loads(path.read_bytes())
-        if set(models["rates"]) == set(props.STATS):
+        if set(models["rates"]) == set(props.STATS) \
+                and models.get("fg3_prior") == props.FG3_PRIOR:
             return models
     df = props.props_dataset(FIRST_TRAIN, last)
     models = props.fit(df[df["mp"] > 0])
